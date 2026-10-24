@@ -1,6 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { setCurrentWorkspace } from "@multica/core/platform";
+import { skillDetailOptions } from "@multica/core/workspace/queries";
 import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../locales/en/common.json";
 import enSkills from "../../locales/en/skills.json";
@@ -12,6 +20,7 @@ const TEST_RESOURCES = {
 const mockImportSkillArchive = vi.hoisted(() => vi.fn());
 const mockPrepareFromPicker = vi.hoisted(() => vi.fn());
 const mockListSkills = vi.hoisted(() => vi.fn());
+const mockWorkspaceId = vi.hoisted(() => ({ value: "ws-1" }));
 const mockWrap = vi.hoisted(() => vi.fn());
 
 vi.mock("@multica/core/api", async () => {
@@ -30,7 +39,7 @@ vi.mock("@multica/core/api", async () => {
 });
 
 vi.mock("@multica/core/hooks", () => ({
-  useWorkspaceId: () => "ws-1",
+  useWorkspaceId: () => mockWorkspaceId.value,
 }));
 
 vi.mock("@multica/core/skills", async () => {
@@ -58,6 +67,7 @@ const ARCHIVE_FILE = new File(["pk"], "review-helper.skill", {
 const PREPARED_OK = {
   ok: true as const,
   file: ARCHIVE_FILE,
+  reconciliationName: "review-helper",
   preview: {
     displayName: "review-helper",
     skillName: "review-helper",
@@ -114,26 +124,31 @@ function renderDialog(onCreated = vi.fn(), onClose = vi.fn()) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  const wrapper = ({ children }: { children: React.ReactNode }) => (
+    <I18nProvider locale="en" resources={TEST_RESOURCES}>
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    </I18nProvider>
+  );
   return {
     onCreated,
     onClose,
-    ...render(
-      <I18nProvider locale="en" resources={TEST_RESOURCES}>
-        <QueryClientProvider client={queryClient}>
-          <CreateSkillDialog onClose={onClose} onCreated={onCreated} />
-        </QueryClientProvider>
-      </I18nProvider>,
-    ),
+    queryClient,
+    ...render(<CreateSkillDialog onClose={onClose} onCreated={onCreated} />, {
+      wrapper,
+    }),
   };
 }
 
 describe("CreateSkillDialog local import", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockWorkspaceId.value = "ws-1";
+    setCurrentWorkspace("workspace-a", "ws-1");
     mockPrepareFromPicker.mockResolvedValue(discovery());
     mockListSkills.mockResolvedValue([]);
     mockWrap.mockReturnValue({
       ...PREPARED_OK,
+      reconciliationName: null,
       preview: { ...PREPARED_OK.preview, source: "archive", fileCount: null },
     });
     mockImportSkillArchive.mockResolvedValue({
@@ -148,6 +163,11 @@ describe("CreateSkillDialog local import", () => {
       created_at: "2026-01-01T00:00:00Z",
       updated_at: "2026-01-01T00:00:00Z",
     });
+  });
+
+  afterEach(() => {
+    setCurrentWorkspace(null, null);
+    vi.unstubAllGlobals();
   });
 
   it("waits for an explicit source choice before opening either picker", () => {
@@ -273,7 +293,11 @@ describe("CreateSkillDialog local import", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Import$/i }));
 
     await waitFor(() => {
-      expect(mockImportSkillArchive).toHaveBeenCalledWith(ARCHIVE_FILE, "fail");
+      expect(mockImportSkillArchive).toHaveBeenCalledWith(
+        ARCHIVE_FILE,
+        "fail",
+        { workspaceSlug: "workspace-a" },
+      );
     });
     await waitFor(() => {
       expect(onCreated).toHaveBeenCalled();
@@ -395,16 +419,23 @@ describe("CreateSkillDialog local import", () => {
       screen.queryByText(/a skill with this name already exists/i),
     ).not.toBeInTheDocument();
   });
-  function pickBatch(names = ["alpha", "beta", "gamma"]) {
+  function pickBatch(
+    names = ["alpha", "beta", "gamma"],
+    prepare?: (name: string) => Promise<typeof PREPARED_OK>,
+  ) {
     mockPrepareFromPicker.mockResolvedValue({
       ok: true,
       items: names.map((name) => ({
         id: `skills/${name}/`,
         preview: { ...PREPARED_OK.preview, skillName: name },
-        prepare: async () => ({
-          ...PREPARED_OK,
-          file: new File([name], `${name}.skill`),
-        }),
+        prepare: () =>
+          prepare
+            ? prepare(name)
+            : Promise.resolve({
+                ...PREPARED_OK,
+                file: new File([name], `${name}.skill`),
+                reconciliationName: name,
+              }),
       })),
     });
     const rendered = renderDialog();
@@ -443,7 +474,7 @@ describe("CreateSkillDialog local import", () => {
   });
 
   it("locks dismissal and reselection during upload and stops only subsequent items", async () => {
-    let resolve!: (value: { id: string }) => void;
+    let resolve!: (value: { id: string; workspace_id: string }) => void;
     mockImportSkillArchive.mockReturnValueOnce(
       new Promise((r) => {
         resolve = r;
@@ -463,7 +494,7 @@ describe("CreateSkillDialog local import", () => {
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Stop after current" }));
-    resolve({ id: "alpha-id" });
+    resolve({ id: "alpha-id", workspace_id: "ws-1" });
     await screen.findByText("Imported: 1 · Failed or uncertain: 0");
     expect(mockImportSkillArchive).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("button", { name: "Import 2" })).toBeEnabled();
@@ -571,7 +602,9 @@ describe("CreateSkillDialog local import", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Import 2" }));
     await screen.findByText("Imported: 1 · Failed or uncertain: 1");
-    mockListSkills.mockResolvedValueOnce([{ name: "alpha" }]);
+    mockListSkills.mockResolvedValueOnce([
+      { name: "alpha", workspace_id: "ws-1" },
+    ]);
     fireEvent.click(screen.getByRole("button", { name: "Check results" }));
     await waitFor(() =>
       expect(
@@ -580,5 +613,336 @@ describe("CreateSkillDialog local import", () => {
     );
     expect(screen.getByRole("button", { name: "Import 0" })).toBeDisabled();
     expect(mockImportSkillArchive).toHaveBeenCalledTimes(2);
+  });
+  it("must stop queued writes after unmount and workspace change", async () => {
+    const { ApiClient } =
+      await vi.importActual<typeof import("@multica/core/api")>(
+        "@multica/core/api",
+      );
+    const { setCurrentWorkspace } = await import("@multica/core/platform");
+    const client = new ApiClient("https://api.example.test");
+    let resolveFirst!: (value: Response) => void;
+    const first = new Promise<Response>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const reply = (name: string) =>
+      new Response(
+        JSON.stringify({
+          status: "created",
+          skill: { id: name, workspace_id: "ws-1", name },
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      );
+    const fetchMock = vi
+      .fn()
+      .mockReturnValueOnce(first)
+      .mockImplementation(async () => reply("beta"));
+    vi.stubGlobal("fetch", fetchMock);
+    setCurrentWorkspace("workspace-a", "ws-1");
+    try {
+      mockImportSkillArchive.mockImplementation(
+        (...args: Parameters<typeof client.importSkillArchive>) =>
+          client.importSkillArchive(...args),
+      );
+      const { unmount, queryClient, onClose, onCreated } = pickBatch([
+        "alpha",
+        "beta",
+      ]);
+      await screen.findByText("alpha");
+      fireEvent.click(screen.getByRole("button", { name: "Import 2" }));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      unmount();
+      setCurrentWorkspace("workspace-b", "ws-2");
+      await act(async () => {
+        resolveFirst(reply("alpha"));
+        await first;
+      });
+      expect(
+        fetchMock.mock.calls.map((call) => call[1].headers["X-Workspace-Slug"]),
+      ).toEqual(["workspace-a"]);
+      expect(
+        queryClient.getQueryData(skillDetailOptions("ws-1", "alpha").queryKey),
+      ).toMatchObject({ id: "alpha", workspace_id: "ws-1" });
+      expect(
+        queryClient.getQueryData(skillDetailOptions("ws-2", "alpha").queryKey),
+      ).toBeUndefined();
+      expect(onClose).not.toHaveBeenCalled();
+      expect(onCreated).not.toHaveBeenCalled();
+    } finally {
+      setCurrentWorkspace(null, null);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["alpha", "download", "empty"])(
+    "keeps archive identity unknown when the verified list contains %s",
+    async (listedName) => {
+      const actual = await vi.importActual<
+        typeof import("@multica/core/skills")
+      >("@multica/core/skills");
+      mockWrap.mockImplementation(actual.wrapExistingSkillArchive);
+      const packed = actual.packStoreZip([
+        {
+          path: "alpha/SKILL.md",
+          data: new TextEncoder().encode("---\nname: alpha\n---\n# Alpha\n"),
+        },
+      ]);
+      const archive = new File(
+        [new Uint8Array(packed).buffer],
+        "download.zip",
+        { type: "application/zip" },
+      );
+      renderDialog();
+      fireEvent.change(document.querySelector("input[accept]")!, {
+        target: { files: [archive] },
+      });
+      await screen.findByText("download");
+      mockImportSkillArchive.mockRejectedValueOnce(
+        new TypeError("response lost after server committed alpha"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: /^Import$/ }));
+      await screen.findByRole("button", { name: "Check results" });
+      mockListSkills.mockResolvedValueOnce(
+        listedName === "empty"
+          ? []
+          : [{ id: listedName, workspace_id: "ws-1", name: listedName }],
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Check results" }));
+      await waitFor(() => expect(mockListSkills).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByRole("button", { name: /^Import$/ })).toBeDisabled();
+      expect(screen.getByText(/skill name is unknown/i)).toBeInTheDocument();
+      expect(mockImportSkillArchive).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    { body: { skills: [] }, verified: false },
+    { body: [], verified: true },
+  ])(
+    "only unlocks directory imports with a verified list: $verified",
+    async ({ body, verified }) => {
+      const { ApiClient } =
+        await vi.importActual<typeof import("@multica/core/api")>(
+          "@multica/core/api",
+        );
+      const client = new ApiClient("https://api.example.test");
+      const { onClose } = pickBatch(["alpha", "beta"]);
+      await screen.findByText("alpha");
+      mockImportSkillArchive.mockRejectedValueOnce(
+        new TypeError("response lost"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Import 2" }));
+      await screen.findByText("Imported: 1 · Failed or uncertain: 1");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      );
+      mockListSkills.mockImplementation(
+        (...args: Parameters<typeof client.listSkills>) =>
+          client.listSkills(...args),
+      );
+      try {
+        fireEvent.click(screen.getByRole("button", { name: "Check results" }));
+        await waitFor(() => expect(mockListSkills).toHaveBeenCalledTimes(1));
+        await act(async () => {
+          await Promise.resolve();
+        });
+        expect(mockListSkills).toHaveBeenCalledWith({
+          requireValidResponse: true,
+          workspaceSlug: "workspace-a",
+        });
+        if (verified) {
+          expect(
+            screen.getByText(
+              "Not found in the refreshed list. You can retry this item.",
+            ),
+          ).toBeInTheDocument();
+          expect(
+            screen.getByRole("button", { name: "Import 1" }),
+          ).toBeEnabled();
+        } else {
+          expect(
+            screen.queryByText(
+              "Not found in the refreshed list. You can retry this item.",
+            ),
+          ).not.toBeInTheDocument();
+          expect(
+            screen.getByRole("button", { name: "Import 0" }),
+          ).toBeDisabled();
+          expect(
+            screen.getByText(/Could not verify the skill list/i),
+          ).toBeInTheDocument();
+        }
+        expect(onClose).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+  it("does not upload when unmounted during asynchronous archive preparation", async () => {
+    const { ApiClient } =
+      await vi.importActual<typeof import("@multica/core/api")>(
+        "@multica/core/api",
+      );
+    const client = new ApiClient("https://api.example.test");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    mockImportSkillArchive.mockImplementation(
+      (...args: Parameters<typeof client.importSkillArchive>) =>
+        client.importSkillArchive(...args),
+    );
+    let resolve!: (value: typeof PREPARED_OK) => void;
+    const prepare = vi.fn(
+      () =>
+        new Promise<typeof PREPARED_OK>((r) => {
+          resolve = r;
+        }),
+    );
+    const { unmount, queryClient } = pickBatch(["alpha", "beta"], prepare);
+    await screen.findByText("alpha");
+    fireEvent.click(screen.getByRole("button", { name: "Import 2" }));
+    expect(prepare).toHaveBeenCalledTimes(1);
+    unmount();
+    setCurrentWorkspace("workspace-b", "ws-2");
+    await act(async () => {
+      resolve(PREPARED_OK);
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(
+      queryClient.getQueryData(skillDetailOptions("ws-1", "alpha").queryKey),
+    ).toBeUndefined();
+  });
+
+  it.each(["preparing", "uploading"])(
+    "stops an A queue when workspace changes without unmounting during %s",
+    async (phase) => {
+      const { ApiClient } =
+        await vi.importActual<typeof import("@multica/core/api")>(
+          "@multica/core/api",
+        );
+      const client = new ApiClient("https://api.example.test");
+      let resolveUpload!: (value: Response) => void;
+      const fetchMock = vi.fn(
+        (_url: string, _init?: RequestInit) =>
+          new Promise<Response>((r) => {
+            resolveUpload = r;
+          }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      mockImportSkillArchive.mockImplementation(
+        (...args: Parameters<typeof client.importSkillArchive>) =>
+          client.importSkillArchive(...args),
+      );
+      let resolvePrepare!: (value: typeof PREPARED_OK) => void;
+      const prepare =
+        phase === "preparing"
+          ? vi.fn(
+              () =>
+                new Promise<typeof PREPARED_OK>((r) => {
+                  resolvePrepare = r;
+                }),
+            )
+          : undefined;
+      const { queryClient, rerender, onClose, onCreated } = pickBatch(
+        ["alpha", "beta"],
+        prepare,
+      );
+      const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+      const aList = [{ id: "existing-a" }];
+      const bList = [{ id: "existing-b" }];
+      queryClient.setQueryData(["workspaces", "ws-1", "skills"], aList);
+      queryClient.setQueryData(["workspaces", "ws-2", "skills"], bList);
+      await screen.findByText("alpha");
+      fireEvent.click(screen.getByRole("button", { name: "Import 2" }));
+      if (phase === "uploading")
+        await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      mockWorkspaceId.value = "ws-2";
+      await act(async () => {
+        setCurrentWorkspace("workspace-b", "ws-2");
+        rerender(<CreateSkillDialog onClose={onClose} onCreated={onCreated} />);
+      });
+      if (phase === "preparing") {
+        await act(async () => {
+          resolvePrepare(PREPARED_OK);
+        });
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(prepare).toHaveBeenCalledTimes(1);
+      } else {
+        await act(async () => {
+          resolveUpload(
+            new Response(
+              JSON.stringify({
+                status: "created",
+                skill: { id: "alpha", workspace_id: "ws-1", name: "alpha" },
+              }),
+              { status: 201 },
+            ),
+          );
+        });
+        expect(
+          fetchMock.mock.calls.map((call) => (call[1] as RequestInit).headers),
+        ).toEqual([
+          expect.objectContaining({ "X-Workspace-Slug": "workspace-a" }),
+        ]);
+        expect(
+          queryClient.getQueryData(
+            skillDetailOptions("ws-1", "alpha").queryKey,
+          ),
+        ).toMatchObject({ id: "alpha", workspace_id: "ws-1" });
+        expect(
+          queryClient.getQueryData(
+            skillDetailOptions("ws-2", "alpha").queryKey,
+          ),
+        ).toBeUndefined();
+        expect(invalidate).toHaveBeenCalledWith({
+          queryKey: ["workspaces", "ws-1", "skills"],
+          refetchType: "none",
+        });
+        expect(
+          screen.getByText("Imported: 1 · Failed or uncertain: 0"),
+        ).toBeInTheDocument();
+      }
+      expect(
+        queryClient.getQueryData(["workspaces", "ws-1", "skills"]),
+      ).toEqual(aList);
+      expect(
+        queryClient.getQueryData(["workspaces", "ws-2", "skills"]),
+      ).toEqual(bList);
+      expect(screen.getByText(/workspace changed/i)).toBeInTheDocument();
+      expect(onClose).not.toHaveBeenCalled();
+      expect(onCreated).not.toHaveBeenCalled();
+    },
+  );
+  it("retains selection ownership when workspace changes before the local panel commits", async () => {
+    let resolve!: (value: ReturnType<typeof discovery>) => void;
+    mockPrepareFromPicker.mockReturnValueOnce(
+      new Promise((r) => {
+        resolve = r;
+      }),
+    );
+    const { rerender, onClose, onCreated } = renderDialog();
+    await act(async () => {
+      fireEvent.change(document.querySelector("input[multiple]")!, {
+        target: { files: [new File(["a"], "SKILL.md")] },
+      });
+      mockWorkspaceId.value = "ws-2";
+      setCurrentWorkspace("workspace-b", "ws-2");
+      rerender(<CreateSkillDialog onClose={onClose} onCreated={onCreated} />);
+    });
+    await act(async () => {
+      resolve(discovery());
+    });
+    expect(screen.getByText(/workspace changed/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Import$/ })).toBeDisabled();
+    expect(mockImportSkillArchive).not.toHaveBeenCalled();
   });
 });

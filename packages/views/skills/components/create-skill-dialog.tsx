@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, type ChangeEvent } from "react";
+import { useLayoutEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   AlertCircle,
   ArrowLeft,
@@ -17,6 +17,11 @@ import {
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "@multica/core/api";
+import {
+  getCurrentSlug,
+  getCurrentWsId,
+  subscribeToCurrentSlug,
+} from "@multica/core/platform";
 import type { Skill } from "@multica/core/types";
 import {
   discoverSkillArchivesFromPickerFiles,
@@ -58,10 +63,11 @@ function seedAfterCreate(
   qc: ReturnType<typeof useQueryClient>,
   wsId: string,
   skill: Skill,
+  refetchType: "active" | "none" = "active",
 ) {
   qc.setQueryData(skillDetailOptions(wsId, skill.id).queryKey, skill);
-  qc.invalidateQueries({ queryKey: workspaceKeys.skills(wsId) });
-  qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId) });
+  qc.invalidateQueries({ queryKey: workspaceKeys.skills(wsId), refetchType });
+  qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId), refetchType });
 }
 
 // Chooser — initial method picker (4 cards)
@@ -428,6 +434,7 @@ function UrlForm({
 function LocalForm({
   prepared,
   preparing,
+  selectionWorkspace,
   onCreated,
   onCancel,
   onDone,
@@ -436,6 +443,7 @@ function LocalForm({
   onBusyChange,
 }: {
   prepared: SkillArchiveDiscovery | null;
+  selectionWorkspace: { wsId: string; slug: string | null };
   preparing: boolean;
   onCreated: (skill: Skill) => void;
   onCancel: () => void;
@@ -450,11 +458,46 @@ function LocalForm({
   const [loading, setLoading] = useState(false);
   const running = useRef(false);
   const stop = useRef(false);
+  const mounted = useRef(false);
+  const cancelled = useRef(false);
+  const owner = useRef(selectionWorkspace).current;
+  const [workspaceChanged, setWorkspaceChanged] = useState(false);
+  const [checkError, setCheckError] = useState("");
+  const isOwnerWorkspace = () =>
+    owner.wsId === getCurrentWsId() && owner.slug === getCurrentSlug();
+  const canContinue = () =>
+    mounted.current && !cancelled.current && isOwnerWorkspace();
+
+  useLayoutEffect(() => {
+    mounted.current = true;
+    const checkWorkspace = () => {
+      if (
+        wsId !== owner.wsId ||
+        owner.wsId !== getCurrentWsId() ||
+        owner.slug !== getCurrentSlug()
+      ) {
+        cancelled.current = true;
+        stop.current = true;
+        setWorkspaceChanged(true);
+      }
+    };
+    checkWorkspace();
+    const unsubscribe = subscribeToCurrentSlug(checkWorkspace);
+    return () => {
+      mounted.current = false;
+      stop.current = true;
+      unsubscribe();
+    };
+  }, [wsId, owner]);
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
   const [results, setResults] = useState<
     Record<
       string,
-      { status: "success" | "failed" | "uncertain"; error?: string }
+      {
+        status: "success" | "failed" | "uncertain";
+        error?: string;
+        reconciliationName?: string | null;
+      }
     >
   >({});
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -463,6 +506,7 @@ function LocalForm({
   const bulk = items.length > 1;
   const eligible = items.filter(
     (item) =>
+      !workspaceChanged &&
       !item.error &&
       !["success", "uncertain"].includes(results[item.id]?.status ?? ""),
   );
@@ -479,20 +523,26 @@ function LocalForm({
 
   const setBusy = (busy: boolean) => {
     running.current = busy;
-    setLoading(busy);
-    onBusyChange(busy);
+    if (mounted.current) {
+      setLoading(busy);
+      onBusyChange(busy);
+    }
   };
 
   const submit = async () => {
-    if (running.current || !selected.length) return;
+    if (running.current || !selected.length || !canContinue() || !owner.slug)
+      return;
     setBusy(true);
     stop.current = false;
+    setCheckError("");
     try {
       for (const item of selected) {
-        if (stop.current) break;
+        if (stop.current || !canContinue()) break;
         let uploading = false;
+        let reconciliationName: string | null = null;
         try {
           const archive = await item.prepare();
+          if (!canContinue()) break;
           if (!archive.ok) {
             setResults((prev) => ({
               ...prev,
@@ -500,11 +550,28 @@ function LocalForm({
             }));
             continue;
           }
+          reconciliationName = archive.reconciliationName;
+          if (!canContinue()) break;
           uploading = true;
-          const skill = await api.importSkillArchive(archive.file, "fail");
-          seedAfterCreate(qc, wsId, skill);
-          setResults((prev) => ({ ...prev, [item.id]: { status: "success" } }));
-          if (!bulk) {
+          const skill = await api.importSkillArchive(archive.file, "fail", {
+            workspaceSlug: owner.slug,
+          });
+          if (skill.workspace_id !== owner.wsId)
+            throw new Error("Import response workspace mismatch");
+          // An in-flight success still belongs to A after the UI moves to B.
+          // Do not refetch A through query functions that read the new global slug.
+          seedAfterCreate(
+            qc,
+            owner.wsId,
+            skill,
+            canContinue() ? "active" : "none",
+          );
+          if (mounted.current)
+            setResults((prev) => ({
+              ...prev,
+              [item.id]: { status: "success" },
+            }));
+          if (!bulk && canContinue()) {
             toast.success(t(($) => $.create.local.toast_imported));
             onCreated(skill);
           }
@@ -515,20 +582,25 @@ function LocalForm({
             (!(err instanceof ApiError) ||
               err.status >= 500 ||
               err.status === 408);
-          setResults((prev) => ({
-            ...prev,
-            [item.id]: {
-              status: uncertain ? "uncertain" : "failed",
-              error: uncertain
-                ? t(($) => $.create.local.uncertain)
-                : err instanceof Error
-                  ? err.message
-                  : t(($) => $.create.local.fallback_error),
-            },
-          }));
+          if (mounted.current)
+            setResults((prev) => ({
+              ...prev,
+              [item.id]: {
+                reconciliationName,
+                status: uncertain ? "uncertain" : "failed",
+                error: uncertain
+                  ? reconciliationName === null
+                    ? t(($) => $.create.local.uncertain_manual)
+                    : t(($) => $.create.local.uncertain)
+                  : err instanceof Error
+                    ? err.message
+                    : t(($) => $.create.local.fallback_error),
+              },
+            }));
           if (uncertain)
             await qc.invalidateQueries({
-              queryKey: workspaceKeys.skills(wsId),
+              queryKey: workspaceKeys.skills(owner.wsId),
+              refetchType: canContinue() ? "active" : "none",
             });
         }
       }
@@ -538,17 +610,31 @@ function LocalForm({
   };
 
   const checkResults = async () => {
-    if (running.current) return;
+    if (running.current || !canContinue() || !owner.slug) return;
     setBusy(true);
+    setCheckError("");
     try {
-      const skills = await api.listSkills();
-      await qc.invalidateQueries({ queryKey: workspaceKeys.skills(wsId) });
+      const skills = await api.listSkills({
+        requireValidResponse: true,
+        workspaceSlug: owner.slug,
+      });
+      if (!canContinue()) return;
+      if (skills.some((skill) => skill.workspace_id !== owner.wsId))
+        throw new Error("Skill list workspace mismatch");
+      await qc.invalidateQueries({
+        queryKey: workspaceKeys.skills(owner.wsId),
+        refetchType: "none",
+      });
+      if (!canContinue()) return;
       setResults((prev) => {
         const next = { ...prev };
         for (const item of items) {
           if (
             next[item.id]?.status === "uncertain" &&
-            !skills.some((skill) => skill.name === item.preview.skillName)
+            next[item.id]?.reconciliationName != null &&
+            !skills.some(
+              (skill) => skill.name === next[item.id]?.reconciliationName,
+            )
           ) {
             next[item.id] = {
               status: "failed",
@@ -559,7 +645,7 @@ function LocalForm({
         return next;
       });
     } catch {
-      // Keep uncertain items locked until a successful refresh can verify absence.
+      if (canContinue()) setCheckError(t(($) => $.create.local.check_failed));
     } finally {
       setBusy(false);
     }
@@ -573,13 +659,23 @@ function LocalForm({
         className="flex-1 min-h-0 space-y-4 overflow-y-auto px-5 py-4"
         aria-busy={loading || preparing}
       >
+        {workspaceChanged && (
+          <p role="alert" className="text-caption text-destructive">
+            {t(($) => $.create.local.workspace_changed)}
+          </p>
+        )}
+        {checkError && (
+          <p role="alert" className="text-caption text-destructive">
+            {checkError}
+          </p>
+        )}
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           <Button
             type="button"
             variant="outline"
             size="sm"
             onClick={onChooseFolder}
-            disabled={loading}
+            disabled={loading || workspaceChanged}
           >
             <FolderOpen className="h-3 w-3" />
             {t(($) => $.create.local.choose_folder)}
@@ -589,7 +685,7 @@ function LocalForm({
             variant="outline"
             size="sm"
             onClick={onChooseArchive}
-            disabled={loading}
+            disabled={loading || workspaceChanged}
           >
             <FileArchive className="h-3 w-3" />
             {t(($) => $.create.local.choose_archive)}
@@ -701,7 +797,7 @@ function LocalForm({
             variant="outline"
             size="sm"
             onClick={checkResults}
-            disabled={loading}
+            disabled={loading || workspaceChanged}
           >
             {t(($) => $.create.local.check_results)}
           </Button>
@@ -764,6 +860,8 @@ export function CreateSkillDialog({
   onCreated?: (skill: Skill) => void;
 }) {
   const { t } = useT("skills");
+  const wsId = useWorkspaceId();
+  const localSelectionWorkspace = useRef({ wsId, slug: getCurrentSlug() });
   const [method, setMethod] = useState<Method>("chooser");
   const [localPrepared, setLocalPrepared] =
     useState<SkillArchiveDiscovery | null>(null);
@@ -785,6 +883,7 @@ export function CreateSkillDialog({
   };
 
   const beginLocalSelection = (): number => {
+    localSelectionWorkspace.current = { wsId, slug: getCurrentSlug() };
     const next = localGeneration.current + 1;
     localGeneration.current = next;
     setLocalEpoch(next);
@@ -973,6 +1072,7 @@ export function CreateSkillDialog({
             key={localEpoch}
             onDone={onClose}
             onBusyChange={setLocalBusyState}
+            selectionWorkspace={localSelectionWorkspace.current}
             prepared={localPrepared}
             preparing={localPreparing}
             onCreated={handleCreated}

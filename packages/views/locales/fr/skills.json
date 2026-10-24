@@ -311,6 +311,9 @@
       "uncertain": "Résultat incertain. Actualisez la liste avant de réessayer. Les noms déjà présents restent verrouillés ; consultez la liste.",
       "check_results": "Vérifier les résultats",
       "retry_ready": "Absent de la liste actualisée. Vous pouvez réessayer.",
+      "uncertain_manual": "Résultat incertain et nom du skill dans l’archive inconnu. Vérifiez manuellement la liste avant de réimporter cette archive.",
+      "check_failed": "Impossible de vérifier la liste. Les imports incertains restent verrouillés. Réessayez la vérification ou consultez la liste manuellement.",
+      "workspace_changed": "L’espace de travail a changé. Les imports restants sont arrêtés. Fermez cette fenêtre et rouvrez-la dans l’espace souhaité.",
       "summary": "Importés : {{success}} · Échecs ou incertains : {{failed}}"
     },
     "url": {

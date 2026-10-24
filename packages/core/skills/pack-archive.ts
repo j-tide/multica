@@ -1,4 +1,4 @@
-import { parseFrontmatter } from "./frontmatter";
+import { parseFrontmatter, skillImportReconciliationName } from "./frontmatter";
 
 /** Mirrors server/internal/handler maxImportFileSize. */
 export const MAX_SKILL_FILE_BYTES = 1 << 20; // 1 MiB
@@ -27,6 +27,8 @@ export type PreparedSkillArchive =
   | {
       ok: true;
       file: File;
+      /** Null when the server import identity cannot be established safely. */
+      reconciliationName: string | null;
       preview: {
         displayName: string;
         skillName: string;
@@ -51,6 +53,7 @@ export function wrapExistingSkillArchive(file: File): PreparedSkillArchive {
   return {
     ok: true,
     file,
+    reconciliationName: null,
     preview: {
       displayName: base,
       skillName,
@@ -111,6 +114,9 @@ function buildPreparedArchive(
   return {
     ok: true,
     file,
+    reconciliationName: skillImportReconciliationName(
+      content, wrapperName || stripArchiveExtension(filename).trim(),
+    ),
     preview: {
       displayName: wrapperName || skillName,
       skillName,

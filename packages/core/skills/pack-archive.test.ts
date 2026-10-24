@@ -56,6 +56,7 @@ describe("prepareSkillArchiveFromEntries", () => {
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
     expect(prepared.preview.skillName).toBe("review-helper");
+    expect(prepared.reconciliationName).toBe("review-helper");
     expect(prepared.preview.description).toBe("Reviews code changes");
     expect(prepared.preview.fileCount).toBe(2);
     expect(prepared.preview.source).toBe("folder");
@@ -364,5 +365,21 @@ describe("discoverSkillArchivesFromPickerFiles", () => {
       undefined,
     ]);
     expect((await result.items[1]!.prepare()).ok).toBe(true);
+  });
+});
+
+describe("prepared archive reconciliation identity", () => {
+  it("uses the generated upload name for a root-level entry without frontmatter", () => {
+    const archive = prepareSkillArchiveFromEntries([
+      { relativePath: "SKILL.md", data: bytes("# Root") },
+    ]);
+    if (!archive.ok) throw new Error("packing failed");
+    expect(archive.reconciliationName).toBe("skill");
+  });
+
+  it("keeps a prebuilt archive identity unknown regardless of its filename", () => {
+    const archive = wrapExistingSkillArchive(new File(["zip"], "download.zip"));
+    if (!archive.ok) throw new Error("wrapping failed");
+    expect(archive.reconciliationName).toBeNull();
   });
 });
