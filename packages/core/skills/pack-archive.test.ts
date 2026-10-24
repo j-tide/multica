@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment node
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_SKILL_FILE_BYTES,
+  discoverSkillArchivesFromPickerFiles,
   isIgnoredArchiveEntry,
   isSkillArchiveFilename,
   packStoreZip,
@@ -65,9 +67,9 @@ describe("prepareSkillArchiveFromEntries", () => {
       "review-helper/SKILL.md",
       "review-helper/scripts/run.sh",
     ]);
-    expect(new TextDecoder().decode(files.get("review-helper/scripts/run.sh"))).toBe(
-      "echo hi",
-    );
+    expect(
+      new TextDecoder().decode(files.get("review-helper/scripts/run.sh")),
+    ).toBe("echo hi");
   });
 
   it("packs a root-level SKILL.md", () => {
@@ -110,7 +112,10 @@ describe("prepareSkillArchiveFromEntries", () => {
   it("skips binary supporting files instead of failing the import", () => {
     const prepared = prepareSkillArchiveFromEntries([
       { relativePath: "skill/SKILL.md", data: bytes(SKILL_MD) },
-      { relativePath: "skill/icon.png", data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]) },
+      {
+        relativePath: "skill/icon.png",
+        data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+      },
     ]);
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
@@ -229,6 +234,135 @@ describe("packStoreZip", () => {
     expect(zip[1]).toBe(0x4b);
     const files = unzipStore(zip);
     expect(new TextDecoder().decode(files.get("SKILL.md"))).toBe("hello");
-    expect(new TextDecoder().decode(files.get("scripts/run.sh"))).toBe("echo hi");
+    expect(new TextDecoder().decode(files.get("scripts/run.sh"))).toBe(
+      "echo hi",
+    );
+  });
+});
+
+describe("discoverSkillArchivesFromPickerFiles", () => {
+  const entry = (path: string) =>
+    fileWithPath("SKILL.md", path, bytes(SKILL_MD));
+
+  it("discovers 13 sibling roots in stable path order and packs isolated contents", async () => {
+    const files = Array.from({ length: 13 }, (_, i) =>
+      entry(`skills/skill-${String(i).padStart(2, "0")}/SKILL.md`),
+    ).reverse();
+    const result = await discoverSkillArchivesFromPickerFiles(files);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.items).toHaveLength(13);
+    expect(result.items.map((item) => item.id)).toEqual(
+      [...result.items.map((item) => item.id)].sort(),
+    );
+    for (const item of result.items) {
+      const packed = await item.prepare();
+      expect(packed.ok).toBe(true);
+      if (packed.ok)
+        expect([
+          ...unzipStore(new Uint8Array(await packed.file.arrayBuffer())).keys(),
+        ]).toEqual([`${item.id}SKILL.md`]);
+    }
+  });
+
+  it("keeps different-depth siblings and similar prefixes separate, stopping at parent roots", async () => {
+    const result = await discoverSkillArchivesFromPickerFiles([
+      entry("skills/foo/SKILL.md"),
+      entry("skills/foobar/SKILL.md"),
+      entry("skills/group/deep/SKILL.md"),
+      entry("skills/foo/example/SKILL.md"),
+      entry("skills/.hidden/SKILL.md"),
+    ]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.items.map((item) => item.id)).toEqual([
+      "skills/foo/",
+      "skills/foobar/",
+      "skills/group/deep/",
+    ]);
+    const packed = await result.items[0]!.prepare();
+    if (!packed.ok) throw new Error("packing failed");
+    expect([
+      ...unzipStore(new Uint8Array(await packed.file.arrayBuffer())).keys(),
+    ]).toEqual(["skills/foo/SKILL.md", "skills/foo/example/SKILL.md"]);
+  });
+
+  it("treats a selected root with SKILL.md as one skill", async () => {
+    const result = await discoverSkillArchivesFromPickerFiles([
+      entry("skills/SKILL.md"),
+      entry("skills/child/SKILL.md"),
+    ]);
+    expect(result.ok && result.items.map((item) => item.id)).toEqual([
+      "skills/",
+    ]);
+  });
+
+  it("rejects missing entrypoints and empty selections", async () => {
+    expect(await discoverSkillArchivesFromPickerFiles([])).toEqual({
+      ok: false,
+      error: "empty",
+    });
+    expect(
+      await discoverSkillArchivesFromPickerFiles([
+        fileWithPath("README.md", "skills/README.md", bytes("readme")),
+      ]),
+    ).toEqual({ ok: false, error: "missing_skill_md" });
+  });
+
+  it("isolates size, count and read failures without reading supporting files at discovery", async () => {
+    const read = vi.fn(async () => {
+      throw new Error("must not read supporting files during discovery");
+    });
+    const result = await discoverSkillArchivesFromPickerFiles([
+      entry("skills/good/SKILL.md"),
+      fileWithPath("doc.md", "skills/good/doc.md", bytes("doc"), {
+        arrayBuffer: read,
+      }),
+      fileWithPath("SKILL.md", "skills/large/SKILL.md", bytes(""), {
+        size: MAX_SKILL_FILE_BYTES + 1,
+        arrayBuffer: read,
+      }),
+      entry("skills/count/SKILL.md"),
+      ...Array.from({ length: 257 }, (_, i) =>
+        fileWithPath(`${i}.md`, `skills/count/${i}.md`, bytes(""), {
+          arrayBuffer: read,
+        }),
+      ),
+      fileWithPath("SKILL.md", "skills/unreadable/SKILL.md", bytes(""), {
+        arrayBuffer: read,
+      }),
+      fileWithPath("icon.png", "skills/good/icon.png", bytes(""), {
+        arrayBuffer: read,
+      }),
+      fileWithPath(".hidden", "skills/good/.hidden", bytes(""), {
+        arrayBuffer: read,
+      }),
+    ]);
+    if (!result.ok) throw new Error("discovery failed");
+    expect(result.items.map((item) => [item.id, item.error])).toEqual([
+      ["skills/count/", "too_many_files"],
+      ["skills/good/", undefined],
+      ["skills/large/", "too_large"],
+      ["skills/unreadable/", "unreadable"],
+    ]);
+    expect(result.items[1]!.preview.fileCount).toBe(2);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+  it("applies the bundle byte limit per root", async () => {
+    const result = await discoverSkillArchivesFromPickerFiles([
+      fileWithPath("SKILL.md", "skills/large/SKILL.md", bytes(SKILL_MD)),
+      ...Array.from({ length: 9 }, (_, i) =>
+        fileWithPath(`${i}.md`, `skills/large/${i}.md`, bytes(""), {
+          size: MAX_SKILL_FILE_BYTES,
+        }),
+      ),
+      fileWithPath("SKILL.md", "skills/small/SKILL.md", bytes(SKILL_MD)),
+    ]);
+    if (!result.ok) throw new Error("discovery failed");
+    expect(result.items.map((item) => item.error)).toEqual([
+      "too_large",
+      undefined,
+    ]);
+    expect((await result.items[1]!.prepare()).ok).toBe(true);
   });
 });

@@ -16,12 +16,13 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { api } from "@multica/core/api";
+import { api, ApiError } from "@multica/core/api";
 import type { Skill } from "@multica/core/types";
 import {
-  prepareSkillArchiveFromPickerFiles,
+  discoverSkillArchivesFromPickerFiles,
   wrapExistingSkillArchive,
-  type PreparedSkillArchive,
+  type SkillArchiveDiscovery,
+  type PreparedSkillArchiveError,
 } from "@multica/core/skills";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { isImeComposing } from "@multica/core/utils";
@@ -40,6 +41,7 @@ import {
   TooltipTrigger,
 } from "@multica/ui/components/ui/tooltip";
 import { Button } from "@multica/ui/components/ui/button";
+import { Checkbox } from "@multica/ui/components/ui/checkbox";
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
 import { Textarea } from "@multica/ui/components/ui/textarea";
@@ -428,53 +430,140 @@ function LocalForm({
   preparing,
   onCreated,
   onCancel,
+  onDone,
   onChooseFolder,
   onChooseArchive,
+  onBusyChange,
 }: {
-  prepared: PreparedSkillArchive | null;
+  prepared: SkillArchiveDiscovery | null;
   preparing: boolean;
   onCreated: (skill: Skill) => void;
   onCancel: () => void;
+  onDone: () => void;
   onChooseFolder: () => void;
   onChooseArchive: () => void;
+  onBusyChange: (busy: boolean) => void;
 }) {
   const { t } = useT("skills");
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const running = useRef(false);
+  const stop = useRef(false);
+  const [excluded, setExcluded] = useState<Set<string>>(new Set());
+  const [results, setResults] = useState<
+    Record<
+      string,
+      { status: "success" | "failed" | "uncertain"; error?: string }
+    >
+  >({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const fadeStyle = useScrollFade(scrollRef);
+  const items = prepared?.ok ? prepared.items : [];
+  const bulk = items.length > 1;
+  const eligible = items.filter(
+    (item) =>
+      !item.error &&
+      !["success", "uncertain"].includes(results[item.id]?.status ?? ""),
+  );
+  const selected = eligible.filter((item) => !excluded.has(item.id));
+  const completed = Object.keys(results).length > 0;
+  const errorLabel = (error: PreparedSkillArchiveError) =>
+    ({
+      missing_skill_md: t(($) => $.create.local.missing_skill_md),
+      too_large: t(($) => $.create.local.too_large),
+      empty: t(($) => $.create.local.empty),
+      too_many_files: t(($) => $.create.local.too_many_files),
+      unreadable: t(($) => $.create.local.unreadable),
+    })[error];
 
-  // Import stays disabled until a valid selection exists, so an invalid one
-  // never reaches here — `prepareError` below already explains why.
+  const setBusy = (busy: boolean) => {
+    running.current = busy;
+    setLoading(busy);
+    onBusyChange(busy);
+  };
+
   const submit = async () => {
-    if (!prepared?.ok) return;
-    setLoading(true);
-    setError("");
+    if (running.current || !selected.length) return;
+    setBusy(true);
+    stop.current = false;
     try {
-      const skill = await api.importSkillArchive(prepared.file, "fail");
-      seedAfterCreate(qc, wsId, skill);
-      toast.success(t(($) => $.create.local.toast_imported));
-      onCreated(skill);
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : t(($) => $.create.local.fallback_error),
-      );
-      setLoading(false);
+      for (const item of selected) {
+        if (stop.current) break;
+        let uploading = false;
+        try {
+          const archive = await item.prepare();
+          if (!archive.ok) {
+            setResults((prev) => ({
+              ...prev,
+              [item.id]: { status: "failed", error: errorLabel(archive.error) },
+            }));
+            continue;
+          }
+          uploading = true;
+          const skill = await api.importSkillArchive(archive.file, "fail");
+          seedAfterCreate(qc, wsId, skill);
+          setResults((prev) => ({ ...prev, [item.id]: { status: "success" } }));
+          if (!bulk) {
+            toast.success(t(($) => $.create.local.toast_imported));
+            onCreated(skill);
+          }
+        } catch (err) {
+          // A transport/server failure may occur after the server committed the import.
+          const uncertain =
+            uploading &&
+            (!(err instanceof ApiError) ||
+              err.status >= 500 ||
+              err.status === 408);
+          setResults((prev) => ({
+            ...prev,
+            [item.id]: {
+              status: uncertain ? "uncertain" : "failed",
+              error: uncertain
+                ? t(($) => $.create.local.uncertain)
+                : err instanceof Error
+                  ? err.message
+                  : t(($) => $.create.local.fallback_error),
+            },
+          }));
+          if (uncertain)
+            await qc.invalidateQueries({
+              queryKey: workspaceKeys.skills(wsId),
+            });
+        }
+      }
+    } finally {
+      setBusy(false);
     }
   };
 
-  const prepareError =
-    prepared && !prepared.ok
-      ? {
-          missing_skill_md: t(($) => $.create.local.missing_skill_md),
-          too_large: t(($) => $.create.local.too_large),
-          empty: t(($) => $.create.local.empty),
-          too_many_files: t(($) => $.create.local.too_many_files),
-        }[prepared.error]
-      : "";
-  const displayError = error || prepareError;
+  const checkResults = async () => {
+    if (running.current) return;
+    setBusy(true);
+    try {
+      const skills = await api.listSkills();
+      await qc.invalidateQueries({ queryKey: workspaceKeys.skills(wsId) });
+      setResults((prev) => {
+        const next = { ...prev };
+        for (const item of items) {
+          if (
+            next[item.id]?.status === "uncertain" &&
+            !skills.some((skill) => skill.name === item.preview.skillName)
+          ) {
+            next[item.id] = {
+              status: "failed",
+              error: t(($) => $.create.local.retry_ready),
+            };
+          }
+        }
+        return next;
+      });
+    } catch {
+      // Keep uncertain items locked until a successful refresh can verify absence.
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <>
@@ -482,54 +571,15 @@ function LocalForm({
         ref={scrollRef}
         style={fadeStyle}
         className="flex-1 min-h-0 space-y-4 overflow-y-auto px-5 py-4"
+        aria-busy={loading || preparing}
       >
-        {preparing && (
-          <div className="flex items-center gap-2 text-caption text-muted-foreground">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            {t(($) => $.create.local.importing)}
-          </div>
-        )}
-
-        {prepared?.ok && (
-          <div className="space-y-3">
-            <div className="rounded-md border px-3 py-2.5">
-              <div className="text-caption text-muted-foreground">
-                {prepared.preview.source === "archive"
-                  ? t(($) => $.create.local.archive_label)
-                  : t(($) => $.create.local.folder_label)}
-              </div>
-              <div className="mt-0.5 truncate text-body font-medium">
-                {prepared.preview.displayName}
-              </div>
-            </div>
-            <div className="space-y-1">
-              <div className="text-body font-medium">{prepared.preview.skillName}</div>
-              {prepared.preview.description ? (
-                <p className="text-caption text-muted-foreground">
-                  {prepared.preview.description}
-                </p>
-              ) : null}
-              {prepared.preview.fileCount != null ? (
-                <p className="text-caption text-muted-foreground">
-                  {t(($) => $.create.local.files, {
-                    count: prepared.preview.fileCount,
-                  })}
-                </p>
-              ) : null}
-            </div>
-          </div>
-        )}
-
-        {/* Source pickers belong in the body: four buttons in the footer
-            overflow the dialog width and clip Cancel (MUL-6794). */}
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           <Button
             type="button"
             variant="outline"
             size="sm"
-            className="w-full"
             onClick={onChooseFolder}
-            disabled={loading || preparing}
+            disabled={loading}
           >
             <FolderOpen className="h-3 w-3" />
             {t(($) => $.create.local.choose_folder)}
@@ -538,57 +588,165 @@ function LocalForm({
             type="button"
             variant="outline"
             size="sm"
-            className="w-full"
             onClick={onChooseArchive}
-            disabled={loading || preparing}
+            disabled={loading}
           >
             <FileArchive className="h-3 w-3" />
             {t(($) => $.create.local.choose_archive)}
           </Button>
         </div>
-
-        {displayError && (
-          <div
-            role="alert"
-            className="flex items-start gap-2 rounded-md bg-destructive/10 px-3 py-2 text-caption text-destructive"
-          >
-            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>
-              {displayError}
-              {isNameConflictError(displayError) && (
-                <>{t(($) => $.create.local.name_conflict_hint)}</>
+        {preparing && (
+          <p role="status" className="text-caption text-muted-foreground">
+            {t(($) => $.create.local.importing)}
+          </p>
+        )}
+        {prepared && !prepared.ok && (
+          <p role="alert" className="text-caption text-destructive">
+            {errorLabel(prepared.error)}
+          </p>
+        )}
+        {bulk && (
+          <label className="flex items-center gap-2 text-caption">
+            <Checkbox
+              disabled={loading || !eligible.length}
+              checked={
+                eligible.length > 0 && selected.length === eligible.length
+              }
+              indeterminate={
+                selected.length > 0 && selected.length < eligible.length
+              }
+              onCheckedChange={(checked) =>
+                setExcluded(
+                  checked
+                    ? new Set()
+                    : new Set(eligible.map((item) => item.id)),
+                )
+              }
+            />
+            {t(($) => $.create.local.select_all)}
+          </label>
+        )}
+        {items.map((item) => (
+          <div key={item.id} className="space-y-1 rounded-md border p-3">
+            <label className="flex items-start gap-2 text-body font-medium">
+              {bulk && (
+                <Checkbox
+                  disabled={loading || !eligible.includes(item)}
+                  checked={!item.error && !excluded.has(item.id)}
+                  onCheckedChange={(checked) =>
+                    setExcluded((prev) => {
+                      const next = new Set(prev);
+                      if (checked) next.delete(item.id);
+                      else next.add(item.id);
+                      return next;
+                    })
+                  }
+                />
               )}
-            </span>
+              <span className="min-w-0 break-words">
+                {item.preview.skillName}
+              </span>
+            </label>
+            <p className="break-all text-caption text-muted-foreground">
+              {item.id}
+            </p>
+            {item.preview.description && (
+              <p className="text-caption text-muted-foreground">
+                {item.preview.description}
+              </p>
+            )}
+            {item.preview.fileCount != null && (
+              <p className="text-caption text-muted-foreground">
+                {t(($) => $.create.local.files, {
+                  count: item.preview.fileCount,
+                })}
+              </p>
+            )}
+            {item.error && (
+              <p role="alert" className="text-caption text-destructive">
+                {errorLabel(item.error)}
+              </p>
+            )}
+            {results[item.id]?.status === "success" && (
+              <p role="status" className="text-caption">
+                {t(($) => $.create.local.toast_imported)}
+              </p>
+            )}
+            {results[item.id]?.error && (
+              <p role="alert" className="text-caption text-destructive">
+                {results[item.id]?.error}
+                {isNameConflictError(results[item.id]?.error ?? "") &&
+                  t(($) => $.create.local.name_conflict_hint)}
+              </p>
+            )}
           </div>
+        ))}
+        {completed && (
+          <p role="status" className="text-caption">
+            {t(($) => $.create.local.summary, {
+              success: Object.values(results).filter(
+                (result) => result.status === "success",
+              ).length,
+              failed: Object.values(results).filter(
+                (result) => result.status !== "success",
+              ).length,
+            })}
+          </p>
+        )}
+        {Object.values(results).some(
+          (result) => result.status === "uncertain",
+        ) && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={checkResults}
+            disabled={loading}
+          >
+            {t(($) => $.create.local.check_results)}
+          </Button>
         )}
       </div>
-
-      <div className="flex shrink-0 items-center justify-end gap-2 border-t bg-muted/30 px-5 py-3">
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          onClick={onCancel}
-          disabled={loading}
-        >
-          {t(($) => $.create.local.cancel)}
-        </Button>
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t bg-muted/30 px-5 py-3">
+        {loading ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              stop.current = true;
+            }}
+          >
+            {t(($) => $.create.local.stop)}
+          </Button>
+        ) : (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={completed ? onDone : onCancel}
+          >
+            {completed
+              ? t(($) => $.create.local.done)
+              : t(($) => $.create.local.cancel)}
+          </Button>
+        )}
         <Button
           type="button"
           size="sm"
           onClick={submit}
-          disabled={!prepared?.ok || loading || preparing}
+          disabled={!selected.length || loading || preparing}
+          aria-busy={loading}
         >
           {loading ? (
             <>
               <Loader2 className="h-3 w-3 animate-spin" />
               {t(($) => $.create.local.importing)}
             </>
+          ) : bulk ? (
+            t(($) => $.create.local.import_count, { count: selected.length })
           ) : (
-            <>
-              <FolderOpen className="h-3 w-3" />
-              {t(($) => $.create.local.import)}
-            </>
+            t(($) => $.create.local.import)
           )}
         </Button>
       </div>
@@ -607,12 +765,17 @@ export function CreateSkillDialog({
 }) {
   const { t } = useT("skills");
   const [method, setMethod] = useState<Method>("chooser");
-  const [localPrepared, setLocalPrepared] = useState<PreparedSkillArchive | null>(
-    null,
-  );
+  const [localPrepared, setLocalPrepared] =
+    useState<SkillArchiveDiscovery | null>(null);
   const [localPreparing, setLocalPreparing] = useState(false);
   const [localEpoch, setLocalEpoch] = useState(0);
   const localGeneration = useRef(0);
+  const [localBusy, setLocalBusy] = useState(false);
+  const localBusyRef = useRef(false);
+  const setLocalBusyState = (busy: boolean) => {
+    localBusyRef.current = busy;
+    setLocalBusy(busy);
+  };
   const folderInputRef = useRef<HTMLInputElement>(null);
   const archiveInputRef = useRef<HTMLInputElement>(null);
 
@@ -650,14 +813,6 @@ export function CreateSkillDialog({
   };
 
   const handleChoose = (next: Method) => {
-    if (next === "local") {
-      // Switch first so cancelling the picker still lands on the local
-      // panel (choose-folder / choose-archive), rather than silently
-      // staying on the chooser with no way to pick a .skill file.
-      setMethod("local");
-      openFolderPicker();
-      return;
-    }
     resetLocal();
     setMethod(next);
   };
@@ -666,6 +821,7 @@ export function CreateSkillDialog({
     // FileList is live: clearing the input empties the same object. Snapshot
     // File handles first so resetting `value` (to allow picking the same
     // folder again) cannot drop the selection.
+    if (localBusyRef.current) return;
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
     if (files.length === 0) return;
@@ -674,31 +830,51 @@ export function CreateSkillDialog({
     setLocalPreparing(true);
     setLocalPrepared(null);
     try {
-      const prepared = await prepareSkillArchiveFromPickerFiles(files);
+      const prepared = await discoverSkillArchivesFromPickerFiles(files);
       if (gen !== localGeneration.current) return;
       setLocalPrepared(prepared);
     } catch {
       if (gen !== localGeneration.current) return;
-      setLocalPrepared({ ok: false, error: "empty" });
+      setLocalPrepared({ ok: false, error: "unreadable" });
     } finally {
       if (gen === localGeneration.current) setLocalPreparing(false);
     }
   };
 
   const onArchivePicked = (e: ChangeEvent<HTMLInputElement>) => {
+    if (localBusyRef.current) return;
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
     beginLocalSelection();
     setMethod("local");
     setLocalPreparing(false);
-    setLocalPrepared(wrapExistingSkillArchive(file));
+    const archive = wrapExistingSkillArchive(file);
+    setLocalPrepared(
+      archive.ok
+        ? {
+            ok: true,
+            items: [
+              {
+                id: file.name,
+                preview: archive.preview,
+                prepare: async () => archive,
+              },
+            ],
+          }
+        : archive,
+    );
   };
 
   const wide = method === "runtime";
 
   return (
-    <Dialog open onOpenChange={(v) => !v && onClose()}>
+    <Dialog
+      open
+      onOpenChange={(v) => {
+        if (!v && !localBusyRef.current) onClose();
+      }}
+    >
       <DialogContent
         showCloseButton={false}
         className={cn(
@@ -718,6 +894,7 @@ export function CreateSkillDialog({
                   render={
                     <button
                       type="button"
+                      disabled={localBusy}
                       onClick={() => {
                         resetLocal();
                         setMethod("chooser");
@@ -729,7 +906,9 @@ export function CreateSkillDialog({
                     </button>
                   }
                 />
-                <TooltipContent side="bottom">{t(($) => $.create.back)}</TooltipContent>
+                <TooltipContent side="bottom">
+                  {t(($) => $.create.back)}
+                </TooltipContent>
               </Tooltip>
             )}
             <div className="min-w-0">
@@ -746,6 +925,7 @@ export function CreateSkillDialog({
               render={
                 <button
                   type="button"
+                  disabled={localBusy}
                   onClick={onClose}
                   className="rounded-sm p-1 text-faint-foreground transition-colors hover:bg-accent/60 hover:text-muted-foreground"
                   aria-label={t(($) => $.create.close_aria)}
@@ -754,12 +934,13 @@ export function CreateSkillDialog({
                 </button>
               }
             />
-            <TooltipContent side="bottom">{t(($) => $.create.close)}</TooltipContent>
+            <TooltipContent side="bottom">
+              {t(($) => $.create.close)}
+            </TooltipContent>
           </Tooltip>
         </div>
 
-        {/* Hidden pickers stay mounted so the chooser click can open them
-            in the same user-gesture (browsers otherwise block input.click()). */}
+        {/* Source buttons open these pickers synchronously in their click handlers. */}
         <input
           ref={bindDirectoryInput}
           type="file"
@@ -790,6 +971,8 @@ export function CreateSkillDialog({
         {method === "local" && (
           <LocalForm
             key={localEpoch}
+            onDone={onClose}
+            onBusyChange={setLocalBusyState}
             prepared={localPrepared}
             preparing={localPreparing}
             onCreated={handleCreated}

@@ -302,7 +302,16 @@
       "cancel": "Cancel",
       "import": "Import",
       "importing": "Importing…",
-      "toast_imported": "Skill imported"
+      "toast_imported": "Skill imported",
+      "select_all": "Select all",
+      "import_count": "Import {{count}}",
+      "done": "Done",
+      "stop": "Stop after current",
+      "unreadable": "Could not read this skill. Choose the folder again.",
+      "uncertain": "The result is uncertain. Check the refreshed skill list before retrying. Existing names remain locked; review them in the list.",
+      "check_results": "Check results",
+      "retry_ready": "Not found in the refreshed list. You can retry this item.",
+      "summary": "Imported: {{success}} · Failed or uncertain: {{failed}}"
     },
     "url": {
       "url_label": "Skill URL",

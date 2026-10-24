@@ -20,7 +20,8 @@ export type PreparedSkillArchiveError =
   | "missing_skill_md"
   | "empty"
   | "too_large"
-  | "too_many_files";
+  | "too_many_files"
+  | "unreadable";
 
 export type PreparedSkillArchive =
   | {
@@ -236,6 +237,90 @@ export async function prepareSkillArchiveFromPickerFiles(
     );
   }
   return buildPreparedArchive(picked, (path) => data.get(path) ?? EMPTY_BYTES);
+}
+
+export type DiscoveredSkillArchive = {
+  id: string;
+  preview: Extract<PreparedSkillArchive, { ok: true }>["preview"];
+  error?: PreparedSkillArchiveError;
+  prepare: () => Promise<PreparedSkillArchive>;
+};
+
+export type SkillArchiveDiscovery =
+  | { ok: true; items: DiscoveredSkillArchive[] }
+  | { ok: false; error: PreparedSkillArchiveError };
+
+/** Discover roots using metadata, reading only bounded entrypoints for preview. */
+export async function discoverSkillArchivesFromPickerFiles(
+  files: File[],
+): Promise<SkillArchiveDiscovery> {
+  const members = files.map((file) => ({
+    path: pickerRelativePath(file),
+    size: file.size,
+  }));
+  const prefixes = [
+    ...new Set(
+      members
+        .filter(
+          (member) =>
+            !isIgnoredArchiveEntry(member.path) && isSkillMdPath(member.path),
+        )
+        .map((member) => archiveEntryPrefix(member.path)),
+    ),
+  ].sort();
+  const roots: string[] = [];
+  for (const prefix of prefixes) {
+    if (!roots.some((root) => prefix.startsWith(root))) roots.push(prefix);
+  }
+  if (!roots.length)
+    return { ok: false, error: files.length ? "missing_skill_md" : "empty" };
+
+  const items: DiscoveredSkillArchive[] = [];
+  for (const prefix of roots) {
+    const group = files.filter((file) =>
+      pickerRelativePath(file).startsWith(prefix),
+    );
+    const selection = selectSkillArchiveMembers(
+      group.map((file) => ({
+        path: pickerRelativePath(file),
+        size: file.size,
+      })),
+    );
+    const fallback = wrapperNameFromPrefix(prefix) || "skill";
+    let error = selection.ok ? undefined : selection.error;
+    let skillName = fallback;
+    let description = "";
+    if (selection.ok) {
+      try {
+        const source = group.find(
+          (file) => pickerRelativePath(file) === selection.skillMdPath,
+        )!;
+        const { frontmatter } = parseFrontmatter(
+          new TextDecoder().decode(await source.arrayBuffer()),
+        );
+        skillName = frontmatter?.name?.trim() || fallback;
+        description = frontmatter?.description?.trim() ?? "";
+      } catch {
+        error = "unreadable";
+      }
+    }
+    items.push({
+      id: prefix || ".",
+      preview: {
+        displayName: fallback,
+        skillName,
+        description,
+        fileCount: selection.ok ? selection.selected.length : null,
+        source: "folder",
+      },
+      error,
+      prepare: () =>
+        error
+          ? Promise.resolve({ ok: false, error })
+          : prepareSkillArchiveFromPickerFiles(group),
+    });
+  }
+  return { ok: true, items };
 }
 
 // --- zip (STORE / uncompressed) -------------------------------------------
