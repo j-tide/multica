@@ -945,4 +945,135 @@ describe("CreateSkillDialog local import", () => {
     expect(screen.getByRole("button", { name: /^Import$/ })).toBeDisabled();
     expect(mockImportSkillArchive).not.toHaveBeenCalled();
   });
+  it("keeps a BOM directory uncertain when its server fallback name exists", async () => {
+    const actual = await vi.importActual<typeof import("@multica/core/skills")>(
+      "@multica/core/skills",
+    );
+    const packed = actual.prepareSkillArchiveFromEntries([
+      {
+        relativePath: "download/SKILL.md",
+        data: new TextEncoder().encode("\ufeff---\nname: alpha\n---\n# Alpha"),
+      },
+    ]);
+    if (!packed.ok) throw new Error("packing failed");
+    mockPrepareFromPicker.mockResolvedValueOnce({
+      ok: true,
+      items: [
+        {
+          id: "download",
+          preview: packed.preview,
+          prepare: async () => packed,
+        },
+      ],
+    });
+    renderDialog();
+    fireEvent.change(document.querySelector("input[multiple]")!, {
+      target: { files: [new File(["bom"], "SKILL.md")] },
+    });
+    await screen.findByText("alpha");
+    mockImportSkillArchive.mockRejectedValueOnce(
+      new TypeError("response lost after server created download"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^Import$/ }));
+    await screen.findByRole("button", { name: "Check results" });
+    mockListSkills.mockResolvedValueOnce([
+      { id: "download-id", workspace_id: "ws-1", name: "download" },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Check results" }));
+    await waitFor(() => expect(mockListSkills).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Check results" }),
+      ).toBeEnabled(),
+    );
+    expect(
+      screen.queryByText(
+        "Not found in the refreshed list. You can retry this item.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Import$/ })).toBeDisabled();
+    expect(mockImportSkillArchive).toHaveBeenCalledTimes(1);
+    expect(mockListSkills).toHaveBeenCalledWith({
+      requireValidResponse: true,
+      workspaceSlug: "workspace-a",
+    });
+    expect(
+      screen.getByText("Imported: 0 · Failed or uncertain: 1"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a late single success in A without closing or navigating", async () => {
+    let resolve!: (value: {
+      id: string;
+      workspace_id: string;
+      name: string;
+    }) => void;
+    mockImportSkillArchive.mockReturnValueOnce(
+      new Promise((r) => {
+        resolve = r;
+      }),
+    );
+    const { onClose, onCreated, queryClient, unmount } = renderDialog();
+    fireEvent.change(document.querySelector("input[multiple]")!, {
+      target: { files: [new File(["a"], "SKILL.md")] },
+    });
+    await screen.findAllByText("review-helper");
+    fireEvent.click(screen.getByRole("button", { name: /^Import$/ }));
+    await waitFor(() =>
+      expect(mockImportSkillArchive).toHaveBeenCalledTimes(1),
+    );
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    unmount();
+    setCurrentWorkspace("workspace-b", "ws-2");
+    await act(async () => {
+      resolve({ id: "late-alpha", workspace_id: "ws-1", name: "alpha" });
+    });
+    expect(
+      queryClient.getQueryData(
+        skillDetailOptions("ws-1", "late-alpha").queryKey,
+      ),
+    ).toMatchObject({ workspace_id: "ws-1" });
+    expect(
+      queryClient.getQueryData(
+        skillDetailOptions("ws-2", "late-alpha").queryKey,
+      ),
+    ).toBeUndefined();
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["workspaces", "ws-1", "skills"],
+      refetchType: "none",
+    });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it("invalidates A without refetch after a late single upload failure", async () => {
+    let reject!: (value: Error) => void;
+    mockImportSkillArchive.mockReturnValueOnce(
+      new Promise((_, r) => {
+        reject = r;
+      }),
+    );
+    const { queryClient, unmount } = renderDialog();
+    fireEvent.change(document.querySelector("input[multiple]")!, {
+      target: { files: [new File(["a"], "SKILL.md")] },
+    });
+    await screen.findAllByText("review-helper");
+    fireEvent.click(screen.getByRole("button", { name: /^Import$/ }));
+    await waitFor(() =>
+      expect(mockImportSkillArchive).toHaveBeenCalledTimes(1),
+    );
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    unmount();
+    setCurrentWorkspace("workspace-b", "ws-2");
+    await act(async () => {
+      reject(new TypeError("network error"));
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["workspaces", "ws-1", "skills"],
+      refetchType: "none",
+    });
+    expect(invalidate).not.toHaveBeenCalledWith(
+      expect.objectContaining({ queryKey: ["workspaces", "ws-2", "skills"] }),
+    );
+  });
 });

@@ -115,7 +115,9 @@ function buildPreparedArchive(
     ok: true,
     file,
     reconciliationName: skillImportReconciliationName(
-      content, wrapperName || stripArchiveExtension(filename).trim(),
+      // Go keeps a leading BOM and therefore does not parse that frontmatter.
+      new TextDecoder("utf-8", { ignoreBOM: true }).decode(dataFor(selection.skillMdPath)),
+      wrapperName || stripArchiveExtension(filename).trim(),
     ),
     preview: {
       displayName: wrapperName || skillName,

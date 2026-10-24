@@ -369,6 +369,27 @@ describe("discoverSkillArchivesFromPickerFiles", () => {
 });
 
 describe("prepared archive reconciliation identity", () => {
+  it.each(["entries", "picker"] as const)(
+    "uses raw BOM semantics for %s while preserving preview and uploaded bytes",
+    async (source) => {
+      const content = bytes("\ufeff---\nname: alpha\n---\n# Alpha");
+      const relativePath = "download/SKILL.md";
+      const archive =
+        source === "entries"
+          ? prepareSkillArchiveFromEntries([{ relativePath, data: content }])
+          : await prepareSkillArchiveFromPickerFiles([
+              fileWithPath("SKILL.md", relativePath, content),
+            ]);
+      if (!archive.ok) throw new Error("packing failed");
+      expect(archive.preview.skillName).toBe("alpha");
+      expect(archive.reconciliationName).toBe("download");
+      const packed = unzipStore(
+        new Uint8Array(await archive.file.arrayBuffer()),
+      );
+      expect(packed.get(relativePath)).toEqual(content);
+    },
+  );
+
   it("uses the generated upload name for a root-level entry without frontmatter", () => {
     const archive = prepareSkillArchiveFromEntries([
       { relativePath: "SKILL.md", data: bytes("# Root") },
