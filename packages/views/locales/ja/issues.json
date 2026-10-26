@@ -481,7 +481,22 @@
     "project_directory_path_copied_with_branch": "プロジェクトディレクトリのパスをコピーしました — 作業は {{branch}} ブランチにあります",
     "workdir_path_copy_failed": "作業ディレクトリのパスをコピーできませんでした",
     "workdir_path_unavailable": "まだローカルの作業ディレクトリがありません。ローカルエージェントがこのタスクを実行していません",
-    "pull_requests_empty_title": "関連する PR はありません。"
+    "pull_requests_empty_title": "関連する PR はありません。",
+    "view": {
+      "activity": "アクティビティ",
+      "chat": "グループチャット",
+      "switch_tooltip": "現在：{{current}}。{{next}}に切り替え。",
+      "deleted_parent": "元のメッセージは削除されました",
+      "missing_parent": "元のメッセージを表示できません",
+      "new_messages": "新しいメッセージ {{count}} 件",
+      "agent": "エージェント",
+      "member": "ユーザー",
+      "system": "システム",
+      "replying_to": "{{name}} に返信",
+      "target_missing": "返信先を表示できません。別のメッセージを選択してください。",
+      "reply_to_thread": "スレッドに返信",
+      "new_messages_other": "新しいメッセージ {{count}} 件"
+    }
   },
   "timeline": {
     "loading": "読み込み中..."

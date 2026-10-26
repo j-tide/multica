@@ -134,17 +134,44 @@ function makeRecordingBinding(key: string) {
 function UploadHost({
   binding,
   expose,
+  editor,
 }: {
   binding: UploadDraftBinding;
   expose: (upload: (file: File) => Promise<UploadResult | null>) => void;
+  editor?: ContentEditorRef;
 }) {
-  const editorRef = useRef<ContentEditorRef | null>(null);
+  const editorRef = useRef<ContentEditorRef | null>(editor ?? null);
   const { handleUpload } = useCoordinatedUploads(binding, [], {}, inertGate, editorRef);
   useEffect(() => {
     expose(handleUpload);
   }, [handleUpload, expose]);
   return null;
 }
+
+it("removes a failed upload's rebuilt placeholder from the reopened owner only", async () => {
+  let rejectUpload!: (error: Error) => void;
+  mockApiUploadFile.mockImplementationOnce(() => new Promise((_, reject) => { rejectUpload = reject; }));
+  const { binding, state } = makeRecordingBinding("reopened-failure");
+  let upload!: (file: File) => Promise<UploadResult | null>;
+  const first = render(<I18nProvider locale="en" resources={TEST_RESOURCES}>
+    <UploadHost binding={binding} expose={(fn) => { upload = fn; }} />
+  </I18nProvider>);
+  let pending!: Promise<UploadResult | null>;
+  act(() => { pending = upload(new File(["bytes"], "failed.txt")); });
+  const id = state.uploads[0]!.clientUploadId;
+  first.unmount();
+  const settle = vi.fn(() => true);
+  const unrelated = vi.fn(() => true);
+  const reopened = render(<I18nProvider locale="en" resources={TEST_RESOURCES}>
+    <UploadHost binding={binding} expose={() => {}} editor={{ settleUploadPlaceholder: settle } as unknown as ContentEditorRef} />
+    <UploadHost binding={makeBinding("unrelated")} expose={() => {}} editor={{ settleUploadPlaceholder: unrelated } as unknown as ContentEditorRef} />
+  </I18nProvider>);
+  await act(async () => { rejectUpload(new Error("503")); await pending; });
+  expect(state.uploads).toEqual([]);
+  expect(settle).toHaveBeenCalledExactlyOnceWith(id, null);
+  expect(unrelated).not.toHaveBeenCalled();
+  reopened.unmount();
+});
 
 /**
  * Paste-as-file recovery lives here, not in a composer test, because the hook

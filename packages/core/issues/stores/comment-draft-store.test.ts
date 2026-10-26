@@ -446,3 +446,50 @@ describe("reply annotations", () => {
   });
 
 });
+
+it("preserves an explicitly chosen nested reply target through text and upload changes", () => {
+  const store = useCommentDraftStore.getState();
+  const key = "reply:chat-issue:root";
+  store.setReplyTarget(key, "nested", "Agent");
+  store.setDraft(key, "Reply to nested message");
+  store.setAttachments(key, [makeAttachment("chat-file")]);
+  store.setAttachments(key, []);
+  expect(useCommentDraftStore.getState().drafts[key]?.replyTarget).toEqual({ commentId: "nested", actorName: "Agent", explicit: true });
+  store.clearDraft(key);
+});
+
+it("restores an explicit reply target and safely drops malformed target metadata", async () => {
+  setCurrentWorkspace("chat-target-tests", "ws-chat-target-tests");
+  const key = "reply:chat-restore:root";
+  const store = useCommentDraftStore.getState();
+  store.setReplyTarget(key, "nested", "Agent");
+  store.setDraft(key, "Preserved reply");
+  await flush();
+  const saved = localStorage.getItem("multica_comment_drafts:chat-target-tests")!;
+  store.clearDraft(key);
+  localStorage.setItem("multica_comment_drafts:chat-target-tests", saved);
+  await useCommentDraftStore.persist.rehydrate();
+  expect(useCommentDraftStore.getState().drafts[key]?.replyTarget?.commentId).toBe("nested");
+  const malformed = JSON.parse(saved);
+  malformed.state.drafts[key].replyTarget = { explicit: true };
+  localStorage.setItem("multica_comment_drafts:chat-target-tests", JSON.stringify(malformed));
+  await useCommentDraftStore.persist.rehydrate();
+  expect(useCommentDraftStore.getState().drafts[key]?.replyTarget).toBeUndefined();
+  expect(store.getDraft(key)).toBe("Preserved reply");
+  store.clearDraft(key);
+  setCurrentWorkspace(null, null);
+});
+
+
+it("keeps an explicitly selected reply open when its text and uploads are cleared", () => {
+  const key = "reply:empty-chat:root";
+  const store = useCommentDraftStore.getState();
+  store.setReplyTarget(key, "nested", "Agent");
+  store.setDraft(key, "temporary body");
+  store.setDraft(key, "");
+  store.setAttachments(key, []);
+  expect(useCommentDraftStore.getState().drafts[key]?.replyTarget?.commentId).toBe("nested");
+  expect(store.getDraft(key)).toBe("");
+  store.clearDraft(key);
+  expect(store.getDraft(key)).toBeUndefined();
+});

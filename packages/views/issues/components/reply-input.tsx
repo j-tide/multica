@@ -1,6 +1,7 @@
 "use client";
 
 import { composeAnnotatedReply, EMPTY_REPLY_ANNOTATIONS, hasReplyIntent } from "@multica/core/drafts/reply-annotation";
+import { useRetainedReplyInputProtection } from "./retained-reply-input";
 import { ReplyAnnotations } from "./reply-annotations";
 import { useRef, useState, useEffect, useMemo } from "react";
 import { ContentEditor, type ContentEditorRef, useFileDropZone, FileDropOverlay, useLazyEditor, useUploadGate, useComposerSubmit } from "../../editor";
@@ -42,6 +43,8 @@ interface ReplyInputProps {
    *  enclosing CommentCard may unmount on scroll-out. */
   draftKey?: CommentDraftKey;
   targetMissing?: boolean;
+  targetLabel?: string;
+  onResetTarget?: () => void;
   onEditAnnotation?: (id: string) => boolean;
   /** Whether a running turn takes this reply by default: true for the turn
    *  that belongs to this thread. Other recipients' turns can still be chosen. */
@@ -64,6 +67,8 @@ function ReplyInput({
   draftKey,
   onEditAnnotation,
   targetMissing = false,
+  targetLabel,
+  onResetTarget,
   steerByDefault = NEVER_STEER_BY_DEFAULT,
 }: ReplyInputProps) {
   const { t } = useT("issues");
@@ -225,6 +230,12 @@ function ReplyInput({
     },
   });
 
+  useRetainedReplyInputProtection(() => {
+    const draft = draftKey ? useCommentDraftStore.getState().drafts[draftKey] : undefined;
+    return submitting || gate.isBlocked() || uploads.length > 0 || !!content.trim() || !!editorRef.current?.getMarkdown()?.trim()
+      || !!draft?.content.trim() || !!draft?.attachments.length || !!draft?.annotations?.length || !!draft?.replyTarget;
+  });
+
   const avatarSize: AvatarSize = size === "sm" ? "sm" : "md";
 
   return (
@@ -243,9 +254,13 @@ function ReplyInput({
           (!isEmpty || annotations.length > 0) && "pb-9",
         )}
       >
+        {targetLabel && <p className="mb-2 text-caption text-muted-foreground">{t(($) => $.detail.view.replying_to, { name: targetLabel })}</p>}
+        {targetMissing && <div role="alert" className="mb-2 text-caption text-destructive">
+          <p>{annotations.length ? t(($) => $.reply.annotations.target_deleted) : t(($) => $.detail.view.target_missing)}</p>
+          {onResetTarget && <Button variant="link" size="sm" onClick={onResetTarget}>{t(($) => $.detail.view.reply_to_thread)}</Button>}
+        </div>}
         {attachmentsBlockSteer && <SteerAttachmentNotice />}
         {draftKey && annotations.length > 0 && <>
-          {targetMissing && <p role="alert" className="mb-2 text-caption text-destructive">{t(($) => $.reply.annotations.target_deleted)}</p>}
           <ReplyAnnotations draftKey={draftKey} annotations={annotations}
             disabled={submitting} onEditAnnotation={onEditAnnotation} />
         </>}
@@ -275,6 +290,7 @@ function ReplyInput({
             onUploadFile={handleUpload}
             onUploadingChange={uploadGate.onUploadingChange}
             debounceMs={100}
+            flushPendingOnUnmount={!!draftKey}
             currentIssueId={issueId}
             attachments={pendingAttachments}
             enableSlashCommands

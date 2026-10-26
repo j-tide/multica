@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
+import Link from "next/link";
 import { useRestoredScrollOffset } from "@multica/views/platform";
 import { WebScrollRestorationProvider } from "./scroll-restoration";
 
@@ -20,6 +21,55 @@ function scrollContainer(el: HTMLElement, top: number) {
 }
 
 describe("WebScrollRestorationProvider", () => {
+  it.each([4230, 0])("captures final position %i before internal navigation even while restore writes are shielded", (top) => {
+    const key = `navigation-final-position-${top}`;
+    const view = render(<WebScrollRestorationProvider>
+      <div data-tab-scroll-root={key} data-testid="container" />
+      <ScrollProbe containerKey={key} />
+      <Link href="/other-issue" prefetch={false} onClick={(event) => event.preventDefault()}>Other issue</Link>
+    </WebScrollRestorationProvider>);
+    scrollContainer(screen.getByTestId("container"), 356);
+    view.rerender(<WebScrollRestorationProvider>
+      <div data-tab-scroll-root={key} data-testid="container" />
+      <ScrollProbe containerKey={key} />
+      <Link href="/other-issue" prefetch={false} onClick={(event) => event.preventDefault()}>Other issue</Link>
+    </WebScrollRestorationProvider>);
+    expect(screen.getByTestId("restored")).toHaveTextContent("356");
+    scrollContainer(screen.getByTestId("container"), top);
+    fireEvent.click(screen.getByRole("link", { name: "Other issue" }));
+    view.rerender(<WebScrollRestorationProvider><ScrollProbe containerKey={key} /></WebScrollRestorationProvider>);
+    expect(screen.getByTestId("restored")).toHaveTextContent(String(top));
+  });
+
+  it.each([
+    { name: "external", href: "https://other.example/issue", click: {}, target: "", download: false },
+    { name: "hash", href: "#comment", click: {}, target: "", download: false },
+    { name: "modified", href: "/other-issue", click: { ctrlKey: true }, target: "", download: false },
+    { name: "new tab", href: "/other-issue", click: {}, target: "_blank", download: false },
+    { name: "download", href: "/other-issue", click: {}, target: "", download: true },
+    { name: "right click", href: "/other-issue", click: { button: 2 }, target: "", download: false },
+  ])("keeps the restore shield for $name links", ({ name, href, click, target, download }) => {
+    const key = `navigation-ignored-${name}`;
+    const ui = <WebScrollRestorationProvider>
+      <div data-tab-scroll-root={key} data-testid="container" />
+      <ScrollProbe containerKey={key} />
+      <Link href={href} prefetch={false} target={target} download={download} onClick={(event) => event.preventDefault()}>Link</Link>
+    </WebScrollRestorationProvider>;
+    const view = render(ui);
+    scrollContainer(screen.getByTestId("container"), 356);
+    view.rerender(<WebScrollRestorationProvider>
+      <div data-tab-scroll-root={key} data-testid="container" />
+      <ScrollProbe containerKey={key} />
+      <Link href={href} prefetch={false} target={target} download={download} onClick={(event) => event.preventDefault()}>Link</Link>
+    </WebScrollRestorationProvider>);
+    scrollContainer(screen.getByTestId("container"), 4230);
+    const link = screen.getByRole("link", { name: "Link" });
+    link.addEventListener("click", (event) => event.preventDefault());
+    fireEvent.click(link, click);
+    view.rerender(<WebScrollRestorationProvider><ScrollProbe containerKey={key} /></WebScrollRestorationProvider>);
+    expect(screen.getByTestId("restored")).toHaveTextContent("356");
+  });
+
   it("serves a captured container offset back for the same pathname", () => {
     const view = render(
       <WebScrollRestorationProvider>
@@ -39,7 +89,7 @@ describe("WebScrollRestorationProvider", () => {
     expect(screen.getByTestId("restored").textContent).toBe("480");
   });
 
-  it("clears the saved offset when the container scrolls back to the top", () => {
+  it("serves an authoritative zero when the container scrolls back to the top", () => {
     const view = render(
       <WebScrollRestorationProvider>
         <div data-tab-scroll-root="cleared" data-testid="container" />
@@ -55,7 +105,7 @@ describe("WebScrollRestorationProvider", () => {
         <ScrollProbe containerKey="cleared" />
       </WebScrollRestorationProvider>,
     );
-    expect(screen.getByTestId("restored").textContent).toBe("none");
+    expect(screen.getByTestId("restored").textContent).toBe("0");
   });
 
   it("shields a just-served memento from the clamped scroll events a restore produces", () => {

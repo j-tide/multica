@@ -481,7 +481,22 @@
     "workdir_path_unavailable": "暂无本地 workdir — 这个任务还没被本地智能体运行过",
     "unsubscribe_subtree_succeeded": "已取消订阅此任务及其子任务。",
     "subscription_update_failed": "无法更新订阅状态，请重试。",
-    "pull_requests_empty_title": "暂无关联 PR。"
+    "pull_requests_empty_title": "暂无关联 PR。",
+    "view": {
+      "activity": "动态模式",
+      "chat": "群聊模式",
+      "switch_tooltip": "当前为{{current}}，可切换为{{next}}",
+      "deleted_parent": "原消息已删除",
+      "missing_parent": "无法查看原消息",
+      "new_messages": "有 {{count}} 条新消息",
+      "agent": "智能体",
+      "member": "用户",
+      "system": "系统",
+      "replying_to": "回复 {{name}}",
+      "target_missing": "无法查看回复对象。请选择另一条消息进行回复。",
+      "reply_to_thread": "回复话题",
+      "new_messages_other": "有 {{count}} 条新消息"
+    }
   },
   "timeline": {
     "loading": "加载中…"

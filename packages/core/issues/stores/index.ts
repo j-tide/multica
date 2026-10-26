@@ -75,3 +75,5 @@ export {
   type SubIssueRowProperties,
   type SubIssueRowPropertyKey,
 } from "./sub-issue-display-store";
+
+export { useIssueDetailViewStore, type IssueDetailView } from "./issue-detail-view-store";

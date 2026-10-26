@@ -28,8 +28,8 @@ vi.mock("@multica/core/paths", () => ({
 }));
 
 vi.mock("../../issues/components/issue-chip", () => ({
-  IssueChip: ({ fallbackLabel }: { fallbackLabel?: string }) => (
-    <span data-testid="issue-chip">{fallbackLabel}</span>
+  IssueChip: ({ fallbackLabel, children }: { fallbackLabel?: string; children?: React.ReactNode }) => (
+    <span data-testid="issue-chip">{children ?? fallbackLabel}</span>
   ),
 }));
 
@@ -39,6 +39,9 @@ vi.mock("../../projects/components/project-chip", () => ({
   ),
 }));
 
+import { renderWithI18n } from "../../test/i18n";
+import { RetainedReplyInput, RetainedReplyInputs } from "../../issues/components/retained-reply-input";
+import { CurrentIssueRenderContextProvider } from "../../issues/current-issue-render-context";
 import { MentionView } from "./mention-view";
 
 const PROJECT_ID = "8f14e45f-ceea-4d0e-a1a2-9b1c0d3e4f5a";
@@ -175,4 +178,19 @@ describe("MentionView issue mention", () => {
     expect(openInNewTab).toHaveBeenCalledWith(ISSUE_PATH, "MUL-7");
     expect(push).not.toHaveBeenCalled();
   });
+});
+
+
+it("preserves This issue semantics in the real editor mention inside a retained reply portal", () => {
+  renderWithI18n(<NavigationProvider value={makeAdapter()}><RetainedReplyInputs>
+    <CurrentIssueRenderContextProvider value={{ id: "issue-1", identifier: "ZJEX-7" }}>
+      <RetainedReplyInput inputKey="reply:issue-1:root">
+        <MentionView {...({ node: { attrs: { type: "issue", id: "issue-1", label: "ZJEX-7" } } } as any)} />
+        <MentionView {...({ node: { attrs: { type: "issue", id: "other-issue", label: "ZJEX-8" } } } as any)} />
+      </RetainedReplyInput>
+    </CurrentIssueRenderContextProvider>
+  </RetainedReplyInputs></NavigationProvider>);
+  expect(screen.getAllByText("This issue")).toHaveLength(1);
+  expect(screen.getByText("ZJEX-8")).toBeInTheDocument();
+  expect(screen.getByText("ZJEX-7")).toBeInTheDocument();
 });
