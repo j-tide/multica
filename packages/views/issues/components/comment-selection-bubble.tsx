@@ -67,7 +67,7 @@ export function CommentSelectionBubble({ range, source, children, owner, markerR
 
   return createPortal(
     <div ref={ref} data-reply-annotation-overlay={owner}
-      style={{ position: "fixed", zIndex: marker ? 20 : 50, visibility: "hidden", width: "max-content" }}>
+      style={{ position: "fixed", zIndex: marker ? 40 : 50, visibility: "hidden", width: "max-content" }}>
       {children}
     </div>,
     document.body,

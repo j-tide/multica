@@ -44,7 +44,7 @@ interface CommentDraft {
   /** Uploads (placeholders + completed) for this composer session. */
   attachments: DraftUpload[];
   annotations?: ReplyAnnotation[];
-  replyTarget?: { commentId: string; actorName: string };
+  replyTarget?: { commentId: string; actorName: string; explicit?: boolean };
   updatedAt: number;
 }
 
@@ -55,6 +55,7 @@ interface CommentDraftStore {
   getAttachments: (key: CommentDraftKey) => Attachment[];
   /** Every upload for this draft (placeholders included) — for status chips. */
   getUploads: (key: CommentDraftKey) => DraftUpload[];
+  setReplyTarget: (key: CommentDraftKey, commentId: string, actorName: string) => void;
   setDraft: (key: CommentDraftKey, content: string) => void;
   /**
    * Append a markdown fragment to the draft body (upload write-back,
@@ -113,19 +114,17 @@ function isMeaningful(content: string, uploads: DraftUpload[], annotations: Repl
   return content.trim().length > 0 || uploads.length > 0 || annotations.length > 0;
 }
 
-// Shared writer for setDraft/setAttachments/upload mutations: an entry with
-// neither text nor uploads carries nothing to recover, so drop it instead of
-// leaving a blank record behind (parity with the old onUpdate "clear on empty
-// text").
+// Keep an explicit reply target until clearDraft: clearing its body must not
+// close the active reply composer. Other empty drafts carry no recoverable intent.
 function writeDraft(
   drafts: Record<string, CommentDraft>,
   key: string,
   content: string,
   uploads: DraftUpload[],
   annotations = drafts[key]?.annotations ?? EMPTY_REPLY_ANNOTATIONS,
-  replyTarget = key.startsWith("reply:") && annotations.length ? drafts[key]?.replyTarget : undefined,
+  replyTarget = key.startsWith("reply:") && (annotations.length || drafts[key]?.replyTarget?.explicit === true) ? drafts[key]?.replyTarget : undefined,
 ): Record<string, CommentDraft> {
-  if (!isMeaningful(content, uploads, annotations)) {
+  if (!isMeaningful(content, uploads, annotations) && replyTarget?.explicit !== true) {
     if (!(key in drafts)) return drafts;
     const next = { ...drafts };
     delete next[key];
@@ -155,10 +154,14 @@ function pruneStaleDrafts(drafts: Record<string, CommentDraft>): Record<string, 
     // were never persisted, so the upload cannot resume).
     const uploads = normalizeStoredUploads(v.attachments);
     const annotations = normalizeReplyAnnotations(v.annotations);
-    if (v.updatedAt >= cutoff && isMeaningful(v.content, uploads, annotations)) {
+    const storedTarget = k.startsWith("reply:") && v.replyTarget && typeof v.replyTarget.commentId === "string" && typeof v.replyTarget.actorName === "string"
+      ? v.replyTarget : undefined;
+    if (v.updatedAt >= cutoff && (isMeaningful(v.content, uploads, annotations) || storedTarget?.explicit === true)) {
       const first = annotations[0];
-      const replyTarget = k.startsWith("reply:") && first ? (v.replyTarget && typeof v.replyTarget.commentId === "string" && typeof v.replyTarget.actorName === "string"
-        ? v.replyTarget : { commentId: first.sourceCommentId, actorName: first.sourceActorName }) : undefined;
+      const replyTarget = k.startsWith("reply:")
+        ? storedTarget?.explicit === true ? storedTarget
+          : first ? storedTarget ?? { commentId: first.sourceCommentId, actorName: first.sourceActorName } : undefined
+        : undefined;
       out[k] = { ...v, attachments: uploads, annotations, replyTarget };
     }
   }
@@ -172,6 +175,10 @@ export const useCommentDraftStore = create<CommentDraftStore>()(
       getDraft: (key) => get().drafts[key]?.content,
       getAttachments: (key) => deriveUploaded(uploadsOf(get().drafts, key)),
       getUploads: (key) => uploadsOf(get().drafts, key),
+      setReplyTarget: (key, commentId, actorName) => set((s) => ({
+        drafts: { ...s.drafts, [key]: { content: s.drafts[key]?.content ?? "", attachments: uploadsOf(s.drafts, key),
+          annotations: s.drafts[key]?.annotations, replyTarget: { commentId, actorName, explicit: true }, updatedAt: Date.now() } },
+      })),
       setDraft: (key, content) =>
         set((s) => ({
           drafts: writeDraft(s.drafts, key, content, uploadsOf(s.drafts, key)),

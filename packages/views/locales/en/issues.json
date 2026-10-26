@@ -487,7 +487,23 @@
     "project_directory_path_copied_with_branch": "Project directory path copied — work is on {{branch}}",
     "workdir_path_copy_failed": "Failed to copy workdir path",
     "workdir_path_unavailable": "No local workdir yet — issue has not been run by a local agent",
-    "pull_requests_empty_title": "No linked pull requests."
+    "pull_requests_empty_title": "No linked pull requests.",
+    "view": {
+      "activity": "Activity",
+      "chat": "Group chat",
+      "switch_tooltip": "Current: {{current}}. Switch to {{next}}.",
+      "deleted_parent": "Original message deleted",
+      "missing_parent": "Original message unavailable",
+      "new_messages": "{{count}} new messages",
+      "agent": "Agent",
+      "member": "User",
+      "system": "System",
+      "replying_to": "Replying to {{name}}",
+      "target_missing": "The reply target is unavailable. Choose another message to reply to.",
+      "reply_to_thread": "Reply to thread",
+      "new_messages_one": "{{count}} new message",
+      "new_messages_other": "{{count}} new messages"
+    }
   },
   "timeline": {
     "loading": "Loading..."

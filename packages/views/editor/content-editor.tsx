@@ -62,6 +62,7 @@ import {
   uploadAndInsertFile,
   insertUploadPlaceholder,
   settleUploadNode,
+  removeUploadNode,
 } from "./extensions/file-upload";
 import { configStore } from "@multica/core/config";
 import { preprocessMarkdown } from "./utils/preprocess";
@@ -318,11 +319,11 @@ interface ContentEditorRef {
     size?: number;
   }) => boolean;
   /**
-   * Turn a placeholder into the finished attachment, in place. False when this
-   * document holds no node for the id — the caller then falls back to
-   * appending the link.
+   * Turn a placeholder into the finished attachment, or remove it on failure.
+   * False when no node matches the id; a successful upload can then be
+   * appended as a link.
    */
-  settleUploadPlaceholder: (uploadId: string, result: UploadResult) => boolean;
+  settleUploadPlaceholder: (uploadId: string, result: UploadResult | null) => boolean;
   /**
    * Cancel the pending debounced `onUpdate` and hand its markdown back to the
    * caller instead of firing it. Returns null when nothing is pending.
@@ -965,7 +966,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       },
       settleUploadPlaceholder: (uploadId, result) => {
         if (!editor || editor.isDestroyed) return false;
-        return settleUploadNode(editor, uploadId, result);
+        return result ? settleUploadNode(editor, uploadId, result) : removeUploadNode(editor, uploadId);
       },
       insertMarkdownAtEnd: (markdown: string) => {
         if (!editor || editor.isDestroyed) return false;

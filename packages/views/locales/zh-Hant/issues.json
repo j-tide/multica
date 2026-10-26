@@ -481,7 +481,22 @@
     "workdir_path_unavailable": "暫無本地 workdir — 這個任務還沒被本地智慧體執行過",
     "unsubscribe_subtree_succeeded": "已取消訂閱此任務及其子任務。",
     "subscription_update_failed": "無法更新訂閱狀態，請重試。",
-    "pull_requests_empty_title": "暫無關聯 PR。"
+    "pull_requests_empty_title": "暫無關聯 PR。",
+    "view": {
+      "activity": "動態模式",
+      "chat": "群聊模式",
+      "switch_tooltip": "目前為{{current}}，可切換為{{next}}",
+      "deleted_parent": "原訊息已刪除",
+      "missing_parent": "無法查看原訊息",
+      "new_messages": "有 {{count}} 則新訊息",
+      "agent": "智慧體",
+      "member": "使用者",
+      "system": "系統",
+      "replying_to": "回覆 {{name}}",
+      "target_missing": "無法查看回覆對象。請選擇另一則訊息進行回覆。",
+      "reply_to_thread": "回覆話題",
+      "new_messages_other": "有 {{count}} 則新訊息"
+    }
   },
   "timeline": {
     "loading": "載入中…"

@@ -14,10 +14,10 @@ import {
  * nothing about, so without this, navigating back lands every list at the
  * top.
  *
- * Capture is continuous rather than before-navigation: the App Router has no
- * reliable "about to leave" hook, so a capture-phase scroll listener records
- * each marked container's offset as the user scrolls, keyed by
- * `pathname::containerKey`. Serving is the same pull-based adapter desktop
+ * A capture-phase scroll listener records each marked container's offset,
+ * keyed by `pathname::containerKey`. Internal anchor navigation also captures
+ * the final live position before the router can unmount the view. Serving is
+ * the same pull-based adapter desktop
  * uses — views read the offset at mount through `useRestoredScrollOffset` /
  * `useRestoredScrollRef`.
  *
@@ -43,8 +43,8 @@ const savedViewState = new Map<string, string>();
  * the restoring container assigns `scrollTop` at attach time, and if its
  * content height isn't final yet the browser clamps the assignment and fires
  * a scroll event — without suppression that clamped value (or a clamp to 0)
- * would overwrite the very memento being restored. A real user scroll within
- * the window is lost, which is the cheap side of the trade.
+ * would overwrite the very memento being restored. Internal anchor navigation
+ * captures the final position even if a user scroll was suppressed here.
  */
 const suppressedUntil = new Map<string, number>();
 const RESTORE_SUPPRESS_MS = 1000;
@@ -59,6 +59,10 @@ export function WebScrollRestorationProvider({
   children: ReactNode;
 }) {
   useEffect(() => {
+    const save = (el: HTMLElement, key: string) => {
+      // Zero is authoritative too; absence lets consumers reuse older offsets.
+      savedOffsets.set(key, { top: Math.max(0, el.scrollTop), height: el.scrollHeight });
+    };
     const onScroll = (e: Event) => {
       const el = e.target;
       if (!(el instanceof HTMLElement)) return;
@@ -70,12 +74,19 @@ export function WebScrollRestorationProvider({
         if (performance.now() < suppressed) return;
         suppressedUntil.delete(key);
       }
-      if (el.scrollTop <= 0) {
-        // Back at the top is the default state — a stale offset would
-        // otherwise resurrect on the next visit.
-        savedOffsets.delete(key);
-      } else {
-        savedOffsets.set(key, { top: el.scrollTop, height: el.scrollHeight });
+      save(el, key);
+    };
+    const onNavigation = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!(link instanceof HTMLAnchorElement) || link.hasAttribute("download") || (link.target && link.target !== "_self")) return;
+      const target = new URL(link.href);
+      if (target.origin !== window.location.origin
+        || (target.pathname === window.location.pathname && target.search === window.location.search)) return;
+      // Unlike an intermediate restore event, this is the departing view's
+      // actual position. Capture before the router changes pathname or DOM.
+      for (const el of document.querySelectorAll<HTMLElement>("[data-tab-scroll-root]")) {
+        save(el, mementoKey(window.location.pathname, el.getAttribute("data-tab-scroll-root") || "main"));
       }
     };
     // Scroll events don't bubble, but they do propagate on the capture
@@ -84,8 +95,11 @@ export function WebScrollRestorationProvider({
       capture: true,
       passive: true,
     });
-    return () =>
+    window.addEventListener("click", onNavigation, { capture: true });
+    return () => {
       window.removeEventListener("scroll", onScroll, { capture: true });
+      window.removeEventListener("click", onNavigation, { capture: true });
+    };
   }, []);
 
   const adapter = useMemo<ScrollRestorationAdapter>(

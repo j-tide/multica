@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useId, useMemo, useRef, useState } from "react";
 import { MessageSquarePlus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { isImeComposing } from "@multica/core/utils";
@@ -14,6 +14,14 @@ import { CommentSelectionBubble } from "./comment-selection-bubble";
 
 type CapturedSelection = NonNullable<ReturnType<typeof captureCommentSelection>>;
 type SourceAnchor = { id: string; range: Range; root: HTMLElement };
+const EDIT_ANNOTATION_EVENT = "multica:edit-comment-annotation";
+
+/** Route an edit to the controller that owns this source DOM, without creating another editor. */
+export function editCommentAnnotation(owner: HTMLElement, id: string): boolean {
+  const event = new CustomEvent(EDIT_ANNOTATION_EVENT, { detail: id, cancelable: true });
+  owner.dispatchEvent(event);
+  return event.defaultPrevented;
+}
 
 export function useCommentAnnotations({ draftKey, sources, enabled, onAdded, editable = false }: {
   draftKey: CommentDraftKey;
@@ -175,9 +183,24 @@ export function useCommentAnnotations({ draftKey, sources, enabled, onAdded, edi
       element?.scrollIntoView({ block: "center", behavior: "instant" });
     }
     pendingFocusId.current = id;
-    setSelection({ ...annotation, range, root }); setEditor({ annotation, existing: true }); setError(false);
+    const current = editingRef.current;
+    setSelection({ ...annotation, range, root });
+    setEditor({ annotation: current?.id === id ? current : annotation, existing: true }); setError(false);
     return true;
   };
+
+  const editRef = useRef(editAnnotation);
+  editRef.current = editAnnotation;
+  useLayoutEffect(() => {
+    const owner = cardRef.current;
+    if (!owner || !enabled) return;
+    const edit = (event: Event) => {
+      const id: unknown = (event as CustomEvent).detail;
+      if (typeof id === "string" && editRef.current(id, true)) event.preventDefault();
+    };
+    owner.addEventListener(EDIT_ANNOTATION_EVENT, edit);
+    return () => owner.removeEventListener(EDIT_ANNOTATION_EVENT, edit);
+  }, [draftKey, enabled]);
 
   const add = useCallback((captured: CapturedSelection | null) => {
     const source = captured && sourcesRef.current.find((e) => e.id === captured.sourceCommentId);

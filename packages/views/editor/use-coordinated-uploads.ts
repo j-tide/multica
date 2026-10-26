@@ -460,6 +460,9 @@ export function useCoordinatedUploads(
               if (target) {
                 if (target.getUploads().some((u) => u.clientUploadId === clientUploadId)) {
                   target.removeUpload(clientUploadId);
+                  if (!mountedRef.current) {
+                    liveEditors.get(target.registryKey)?.current?.settleUploadPlaceholder(clientUploadId, null);
+                  }
                   // Paste-as-file has no on-disk copy to re-attach from, so
                   // its text goes back into the composer.
                   if (pastedText !== undefined) {

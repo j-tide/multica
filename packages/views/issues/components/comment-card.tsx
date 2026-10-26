@@ -35,6 +35,7 @@ import { ContentEditor, type ContentEditorRef, ReadonlyContent, useFileDropZone,
 import { useCommentUploads } from "./use-comment-uploads";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
 import { api, dispatchReasonCode, errorCode } from "@multica/core/api";
+import { RetainedReplyInput } from "./retained-reply-input";
 import { ReplyInput } from "./reply-input";
 import { CommentTriggerChips } from "./comment-trigger-chips";
 import { useCommentTriggerPreview } from "../hooks/use-comment-trigger-preview";
@@ -623,7 +624,10 @@ function CommentRevisionConflict({
 
 // Single comment row (used for both parent and replies within the same Card)
 
-function CommentRow({
+export function CommentRow({
+  chat = false,
+  compact = false,
+  onReplyClick,
   runHeader,
   runMetadata,
   replyTo,
@@ -641,6 +645,9 @@ function CommentRow({
   onResolveToggle,
   onCopyLink,
 }: {
+  chat?: boolean;
+  compact?: boolean;
+  onReplyClick?: () => void;
   runHeader?: ReactNode;
   runMetadata?: ReactNode;
   replyTo?: ReactNode;
@@ -693,9 +700,11 @@ function CommentRow({
           this reply ends. The header stays opaque and matches this comment's
           highlight state while it occludes the body scrolling underneath. */}
       <StickyHeaderShell
+        sticky={!chat}
         highlighted={isHighlighted}
-        className="flex items-center gap-2.5 px-4 max-md:px-3 pt-3 pb-1"
+        className={cn("flex min-w-0 items-center gap-2.5 px-4 max-md:px-3", compact ? "pt-0 pb-0" : "pt-3 pb-1")}
       >
+        {compact ? <span className="sr-only">{entry.actor_name || getActorName(entry.actor_type, entry.actor_id)}</span> : <>
         <ActorAvatar
           actorType={entry.actor_type}
           actorId={entry.actor_id}
@@ -706,13 +715,15 @@ function CommentRow({
           enableHoverCard
           showStatusDot
         />
-        <span className="cursor-pointer text-body font-medium">
+        <span data-comment-author className={cn("min-w-0 truncate cursor-pointer font-medium", chat ? "text-label" : "text-body")}>
           {entry.actor_name || getActorName(entry.actor_type, entry.actor_id)}
         </span>
+        {chat && <span data-comment-identity className="shrink-0 whitespace-nowrap text-caption text-muted-foreground">{entry.actor_type === "agent" ? t(($) => $.detail.view.agent) : entry.actor_type === "member" ? t(($) => $.detail.view.member) : t(($) => $.detail.view.system)}</span>}
+        </>}
         <Tooltip>
           <TooltipTrigger
             render={
-              <span className="text-caption text-muted-foreground cursor-default">
+              <span data-comment-time className="shrink-0 whitespace-nowrap text-caption text-muted-foreground cursor-default">
                 {timeAgo(entry.created_at)}
               </span>
             }
@@ -736,6 +747,7 @@ function CommentRow({
         )}
 
         <div data-comment-actions className="ml-auto flex shrink-0 items-center gap-0.5">
+          {onReplyClick && <Button variant="ghost" size="icon-sm" onClick={onReplyClick} aria-label={t(($) => $.reply.placeholder)}><CornerUpLeft /></Button>}
           {!edit.editing && <QuickEmojiPicker
             onSelect={(emoji) => onToggleReaction(entry.id, emoji)}
             ariaLabel={t(($) => $.comment.add_reaction)}
@@ -935,7 +947,7 @@ function CommentRow({
 }
 
 /** Names the input a run answers once other rows separate the two (MUL-7628). */
-function ReplyToQuote({ entry, onJump }: { entry: TimelineEntry; onJump?: (commentId: string) => void }) {
+export function ReplyToQuote({ entry, onJump }: { entry: TimelineEntry; onJump?: (commentId: string) => void }) {
   const { t } = useT("issues");
   const { getActorName } = useActorName();
   const label = t(($) => $.comment.replying_to, {
@@ -952,18 +964,19 @@ function ReplyToQuote({ entry, onJump }: { entry: TimelineEntry; onJump?: (comme
 }
 
 /** A run without a persisted reply still belongs to the agent, never its trigger author. */
-export function AgentRunComment({ run, standalone = false, commentProps, entering = false, replyTo, highlightedId }: {
+export function AgentRunComment({ run, standalone = false, commentProps, entering = false, replyTo, highlightedId, failureNotice }: {
   run: CommentRun;
   standalone?: boolean;
   entering?: boolean;
   commentProps?: CommentCardProps;
+  failureNotice?: TimelineEntry;
   /** The input this run answers, shown when the thread no longer places the two together. */
   replyTo?: ReactNode;
   /** The flashed jump target: the slot's comment id, or the run's task id until it has one. */
   highlightedId?: string | null;
 }) {
   const viewState = useInlineCommentRunState();
-  const replyEntry = commentProps?.entry;
+  const replyEntry = commentProps?.entry ?? failureNotice;
   // A deleted reply renders nothing in a run slot either (see CommentRow), so
   // the slot falls back to the run's own activity block: the run happened, and
   // it still carries `hasReply`, so it never prints the deleted body as its
@@ -1522,10 +1535,12 @@ function CommentCardImpl({
 
               {/* Reply input */}
               <div className="border-t border-border/50 px-4 max-md:px-3 py-2.5">
-                <ReplyInput
+                <RetainedReplyInput inputKey={`reply:${issueId}:${entry.id}`}><ReplyInput
                   issueId={issueId}
                   parentId={replyTargetId}
                   targetMissing={replyTargetMissing}
+                  targetLabel={replyTarget?.explicit ? replyTarget.actorName : undefined}
+                  onResetTarget={!deleted ? () => useCommentDraftStore.getState().setReplyTarget(`reply:${issueId}:${entry.id}`, entry.id, entry.actor_name || getActorName(entry.actor_type, entry.actor_id)) : undefined}
                   placeholder={t(($) => $.reply.placeholder)}
                   size="sm"
                   avatarType="member"
@@ -1535,7 +1550,7 @@ function CommentCardImpl({
                   steerByDefault={steerThreadRunByDefault}
                   onSubmit={(content, attachmentIds, suppressAgentIds, steerTaskIds) => replyTargetMissing ? Promise.resolve(false) : onReply(replyTargetId, content, attachmentIds, suppressAgentIds, steerTaskIds)}
                   onAccepted={onReplyAccepted}
-                />
+                /></RetainedReplyInput>
               </div>
             </>
           )}

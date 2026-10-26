@@ -8,6 +8,7 @@ import { issueStatusKeys } from "@multica/core/issue-statuses";
 import { I18nProvider } from "@multica/core/i18n/react";
 import { toast } from "sonner";
 import { useResolvedExpandStore } from "@multica/core/issues/stores/resolved-expand-store";
+import { useIssueDetailViewStore } from "@multica/core/issues/stores/issue-detail-view-store";
 import { useCommentCollapseStore } from "@multica/core/issues/stores";
 import {
   DEFAULT_SUB_ISSUE_ROW_PROPERTIES,
@@ -367,6 +368,7 @@ vi.mock("@multica/core/api", () => ({
 // Mock recent issues store
 const mockRecordVisit = vi.fn();
 vi.mock("@multica/core/issues/stores", async () => ({
+  ...(await vi.importActual<typeof import("@multica/core/issues/stores/issue-detail-view-store")>("@multica/core/issues/stores/issue-detail-view-store")),
   // Real store, not a stub: resolved-thread expand/collapse behavior under
   // test runs through it. Deep import keeps the persisted sibling stores
   // (which need localStorage) out of this mock.
@@ -480,16 +482,27 @@ vi.mock("@multica/core/issues/stores", async () => ({
 // layout.
 const scrollIntoViewSpy = vi.hoisted(() => vi.fn());
 const scrollToIndexSpy = vi.hoisted(() => vi.fn());
+const virtualList = vi.hoisted(() => ({
+  initialIndex: undefined as unknown,
+  initialTop: undefined as number | undefined,
+  ready: undefined as undefined | (() => void),
+}));
 
 vi.mock("react-virtuoso", () => ({
   Virtuoso: forwardRef(function MockVirtuoso(
-    { data, itemContent, computeItemKey }: {
+    { data, itemContent, computeItemKey, initialTopMostItemIndex, initialScrollTop, itemsRendered }: {
       data: unknown[];
       itemContent: (i: number, item: unknown) => unknown;
       computeItemKey: (i: number, item: unknown) => React.Key;
+      initialTopMostItemIndex?: unknown;
+      initialScrollTop?: number;
+      itemsRendered?: () => void;
     },
     ref: any,
   ) {
+    virtualList.initialIndex = initialTopMostItemIndex;
+    virtualList.initialTop = initialScrollTop;
+    virtualList.ready = itemsRendered;
     useImperativeHandle(ref, () => ({
       // Real Virtuoso ref methods are not exercised by tests in this file
       // since the deep-link cold-path drives the container's scrollTop on the
@@ -510,6 +523,7 @@ vi.mock("react-virtuoso", () => ({
 // jsdom's HTMLElement.prototype.scrollIntoView is a no-op stub; replace it
 // with a spy so the deep-link effect's call can be observed.
 beforeEach(() => {
+  useIssueDetailViewStore.setState({ view: "activity" });
   scrollIntoViewSpy.mockClear();
   scrollToIndexSpy.mockClear();
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
@@ -747,6 +761,220 @@ describe("IssueDetail (shared)", () => {
     // Reset project mock — individual tests override per case. Default fixture
     // has project_id: null so getProject is not invoked.
     mockApiObj.getProject.mockReset();
+  });
+
+  describe("mode restoration at scroll boundaries", () => {
+    let sequence = 0;
+    afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); mockApiObj.createComment.mockReset(); });
+    async function prepare({ beforeY = 400, targetY = 900, height = 1300 } = {}) {
+      const issueId = `boundary-${++sequence}`;
+      const queryClient = createTestQueryClient();
+      const view = render(<I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={queryClient}><IssueDetail issueId={issueId} /></QueryClientProvider>
+      </I18nProvider>);
+      await screen.findByText("Started working on this");
+      const scroller = view.container.querySelector<HTMLElement>('[data-tab-scroll-root]')!;
+      const geometry = { targetY, height, viewport: 500, targetHeight: 200 };
+      let top = 500;
+      let writes = 0;
+      const clamp = (value: number) => Math.min(Math.max(0, geometry.height - geometry.viewport), Math.max(0, value));
+      Object.defineProperties(scroller, {
+        scrollTop: { configurable: true, get: () => { top = clamp(top); return top; }, set: (value: number) => { writes++; top = clamp(value); } },
+        scrollHeight: { configurable: true, get: () => geometry.height },
+        clientHeight: { configurable: true, get: () => geometry.viewport },
+      });
+      const nativeRect = HTMLElement.prototype.getBoundingClientRect;
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function(this: HTMLElement) {
+        if (this === scroller) return new DOMRect(0, 0, 800, geometry.viewport);
+        if (this.id === "comment-comment-1" || this.closest('[id="comment-comment-1"]')) {
+          return new DOMRect(0, (useIssueDetailViewStore.getState().view === "chat" ? geometry.targetY : beforeY) - scroller.scrollTop, 700, geometry.targetHeight);
+        }
+        return nativeRect.call(this);
+      });
+      let frameId = 0;
+      const pending = new Map<number, FrameRequestCallback>();
+      vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { pending.set(++frameId, callback); return frameId; });
+      vi.stubGlobal("cancelAnimationFrame", (id: number) => pending.delete(id));
+      const paint = (count: number) => {
+        for (let frame = 0; frame < count; frame++) act(() => {
+          const work = [...pending.values()]; pending.clear(); work.forEach((callback) => callback(performance.now()));
+        });
+      };
+      fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Group chat" }));
+      expect(virtualList.initialIndex).toEqual({ index: 0, align: "start" });
+      expect(virtualList.initialTop).toBeUndefined();
+      return { ...view, scroller, geometry, queryClient, issueId, paint, writes: () => writes,
+        ready: () => act(() => virtualList.ready?.()),
+        rerenderDetail: (highlightCommentId?: string) => view.rerender(<I18nProvider locale="en" resources={TEST_RESOURCES}>
+          <QueryClientProvider client={queryClient}><IssueDetail issueId={issueId} highlightCommentId={highlightCommentId} /></QueryClientProvider>
+        </I18nProvider>),
+      };
+    }
+
+    it.each([
+      { name: "reachable", height: 3000, beforeY: 400, targetY: 900, expected: 1000 },
+      { name: "bottom saturated", height: 1300, beforeY: 400, targetY: 900, expected: 800 },
+      { name: "top saturated", height: 1300, beforeY: 600, targetY: 20, expected: 0 },
+    ])("finishes at the nearest reachable position and stops writing: $name", async (scenario) => {
+      const fixture = await prepare(scenario);
+      fixture.paint(20);
+      expect(fixture.scroller.scrollTop).toBe(500);
+      expect(fixture.writes()).toBe(0);
+      fixture.ready(); fixture.paint(8);
+      expect(fixture.scroller.scrollTop).toBe(scenario.expected);
+      expect(virtualList.initialIndex).toBe(0);
+      const completedWrites = fixture.writes();
+      fixture.paint(35);
+      expect(fixture.writes()).toBe(completedWrites);
+    });
+
+    it("waits for shrinking and moving geometry to settle at the new boundary", async () => {
+      const fixture = await prepare({ height: 2200, targetY: 1100 });
+      fixture.ready(); fixture.paint(2);
+      expect(virtualList.initialIndex).not.toBe(0);
+      fixture.geometry.height = 1300; fixture.geometry.targetHeight = 80;
+      for (let frame = 0; frame < 4; frame++) {
+        fixture.geometry.targetY = 900 - frame * 10;
+        fixture.paint(1);
+        expect(virtualList.initialIndex).not.toBe(0);
+      }
+      fixture.geometry.viewport = 600;
+      fixture.paint(2);
+      expect(virtualList.initialIndex).not.toBe(0);
+      fixture.paint(5);
+      expect(fixture.scroller.scrollTop).toBe(700);
+      expect(virtualList.initialIndex).toBe(0);
+      const completedWrites = fixture.writes(); fixture.paint(35);
+      expect(fixture.writes()).toBe(completedWrites);
+    });
+
+    it("releases saving and bottom following after a saturated restore", async () => {
+      const fixture = await prepare();
+      fixture.paint(20); fixture.ready(); fixture.paint(8);
+      expect(virtualList.initialIndex).toBe(0);
+      const entry: TimelineEntry = { ...mockTimeline[0]!, id: "boundary-new", content: "After boundary", created_at: "2030-01-01T00:00:00Z" };
+      fixture.geometry.height = 1500;
+      act(() => fixture.queryClient.setQueryData(["issues", "timeline", fixture.issueId], [...mockTimeline, entry]));
+      await screen.findByText("After boundary");
+      fixture.paint(3);
+      expect(fixture.scroller.scrollTop).toBe(1000);
+      expect(fixture.container.querySelector('[data-chat-unread-status]')).toBeEmptyDOMElement();
+      fireEvent.scroll(fixture.scroller);
+      fixture.unmount();
+      const returned = renderIssueDetail(fixture.issueId);
+      await screen.findByText("Started working on this");
+      await waitFor(() => expect(returned.container.querySelector<HTMLElement>('[data-tab-scroll-root]')?.scrollTop).toBe(1000));
+    });
+
+    it("allows a user wheel to cancel before the target list is ready", async () => {
+      const fixture = await prepare();
+      fireEvent.wheel(fixture.scroller, { deltaY: -1 });
+      fixture.ready(); fixture.paint(40);
+      expect(fixture.scroller.scrollTop).toBe(500);
+      expect(fixture.writes()).toBe(0);
+      expect(virtualList.initialIndex).toBe(0);
+    });
+
+    it("yields to an explicit deep link while restoration is waiting", async () => {
+      const fixture = await prepare();
+      fixture.rerenderDetail("comment-2");
+      fixture.paint(40);
+      expect(fixture.scroller.scrollTop).toBe(0);
+      fixture.rerenderDetail(); fixture.paint(8);
+      expect(virtualList.initialIndex).toBe(0);
+      const completedWrites = fixture.writes(); fixture.paint(35);
+      expect(fixture.writes()).toBe(completedWrites);
+    });
+
+    it("yields to a newly accepted comment while restoration is waiting", async () => {
+      const fixture = await prepare();
+      mockApiObj.createComment.mockResolvedValue({ id: "boundary-posted", issue_id: fixture.issueId,
+        content: "New accepted comment", author_type: "member", author_id: "user-1", parent_id: null,
+        type: "comment", created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" });
+      fireEvent.click(screen.getByTestId("comment-composer-shell"));
+      const editor = await screen.findByPlaceholderText("Leave a comment...");
+      fireEvent.change(editor, { target: { value: "New accepted comment" } });
+      const composer = editor.closest<HTMLElement>("[aria-busy], .relative.flex.flex-col.rounded-lg")!;
+      fireEvent.click(within(composer).getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(mockApiObj.createComment).toHaveBeenCalled());
+      await waitFor(() => expect(screen.getByText("New accepted comment")).toBeInTheDocument());
+      fixture.ready(); fixture.paint(5);
+      expect(virtualList.initialIndex).toBe(0);
+      expect(fixture.writes()).toBe(0);
+      expect(scrollToIndexSpy).toHaveBeenCalledWith({ index: 2, align: "end", offset: 0 });
+    });
+  });
+
+  it.each(["failed", "cancelled"] as const)("deduplicates a chat %s notice while preserving its real run retry action", async (status) => {
+    const task: AgentTask = { id: "failed-run", agent_id: "agent-1", runtime_id: "runtime-1", issue_id: "issue-1", kind: "direct", status, priority: 0,
+      created_at: "2026-01-16T00:00:00Z", dispatched_at: null, started_at: null, completed_at: "2026-01-16T00:01:00Z", result: null, error: "Unique failure notice", failure_reason: "timeout" };
+    mockApiObj.listTasksByIssue.mockResolvedValue([task]);
+    mockApiObj.listTimeline.mockResolvedValue([{ type: "comment", id: "failed-notice", actor_type: "agent", actor_id: "agent-1", comment_type: "system", source_task_id: task.id,
+      content: "Unique failure notice", created_at: "2026-01-16T00:01:00Z" }]);
+    useIssueDetailViewStore.getState().setView("chat");
+    const { container } = renderIssueDetail();
+    await waitFor(() => expect(container.querySelector('[data-run-slot-id="failed-run"]')).toBeInTheDocument());
+    const retry = await within(container.querySelector<HTMLElement>('[data-run-slot-id="failed-run"]')!).findByRole("button", { name: "Retry run" });
+    expect(container.querySelectorAll('[id="comment-failed-notice"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-run-slot-id="failed-run"]')).toHaveLength(1);
+    expect(screen.queryByText("Unique failure notice", { exact: true })).not.toBeInTheDocument();
+    fireEvent.click(retry);
+    await waitFor(() => expect(mockApiObj.rerunIssue).toHaveBeenCalled());
+  });
+
+  it("announces only unique new historical comments without moving focus or position", async () => {
+    useIssueDetailViewStore.getState().setView("chat");
+    const queryClient = createTestQueryClient();
+    const { container } = render(<I18nProvider locale="en" resources={TEST_RESOURCES}>
+      <QueryClientProvider client={queryClient}><IssueDetail issueId="issue-1" /></QueryClientProvider>
+    </I18nProvider>);
+    await screen.findByText("Started working on this");
+    const status = container.querySelector<HTMLElement>('[data-chat-unread-status]')!;
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveAttribute("aria-atomic", "true");
+    expect(status).toBeEmptyDOMElement();
+    const scroller = container.querySelector<HTMLElement>('[data-tab-scroll-root]')!;
+    Object.defineProperties(scroller, { scrollHeight: { configurable: true, value: 2000 }, clientHeight: { configurable: true, value: 500 } });
+    scroller.scrollTop = 300;
+    fireEvent.wheel(scroller, { deltaY: -10 });
+    const focus = screen.getByRole("button", { name: "Group chat" });
+    focus.focus();
+    const announcements: string[] = [];
+    const observer = new MutationObserver(() => { announcements.push(status.textContent ?? ""); });
+    observer.observe(status, { subtree: true, childList: true, characterData: true });
+    const incoming: TimelineEntry = { ...mockTimeline[0]!, id: "unique-live-comment", content: "New remote comment", created_at: "2030-01-01T00:00:00Z" };
+    act(() => queryClient.setQueryData(["issues", "timeline", "issue-1"], [...mockTimeline, incoming]));
+    await waitFor(() => expect(status).toHaveTextContent("1 new message"));
+    expect(document.activeElement).toBe(focus);
+    expect(scroller.scrollTop).toBe(300);
+    for (const entry of [ { ...incoming, content: "Edited remote comment" }, { ...incoming, reactions: [{ id: "reaction", comment_id: incoming.id, created_at: incoming.created_at, emoji: "👍", actor_id: "user-1", actor_type: "member" }] }, { ...incoming } ]) {
+      act(() => queryClient.setQueryData(["issues", "timeline", "issue-1"], [...mockTimeline, entry]));
+      await act(async () => {});
+    }
+    expect(announcements).toEqual(["1 new message"]);
+    expect(document.activeElement).toBe(focus);
+    expect(scroller.scrollTop).toBe(300);
+    observer.disconnect();
+  });
+
+  it("renders a global chat stream with unique reply anchors and keeps the bottom composer mounted", async () => {
+    mockApiObj.listTimeline.mockResolvedValue([
+      { type: "comment", id: "root", actor_type: "member", actor_id: "user-1", content: "Root message", created_at: "2026-01-01T12:00:00Z" },
+      { type: "comment", id: "other", actor_type: "member", actor_id: "user-1", content: "Other thread", created_at: "2026-01-01T12:01:00Z" },
+      { type: "comment", id: "reply", actor_type: "member", actor_id: "user-1", content: "Late reply", parent_id: "root", created_at: "2026-01-01T12:02:00Z" },
+    ]);
+    const { container } = renderIssueDetail();
+    await screen.findByText("Root message");
+    const composer = screen.getByTestId("comment-composer-shell");
+    act(() => useIssueDetailViewStore.getState().setView("chat"));
+    await screen.findByRole("button", { name: "Group chat" });
+    expect(screen.getByTestId("comment-composer-shell")).toBe(composer);
+    expect([...container.querySelectorAll('[id^="comment-"]')].map((element) => element.id)).toEqual(["comment-root", "comment-other", "comment-reply"]);
+    expect(screen.getByText("Late reply")).toBeInTheDocument();
+    act(() => useIssueDetailViewStore.getState().setView("activity"));
+    expect(screen.getByTestId("comment-composer-shell")).toBe(composer);
   });
 
   it("passes the issue's agent assignment to the local-directory hint", async () => {
@@ -3478,7 +3706,7 @@ describe("IssueDetail (shared)", () => {
     // Anchor on the heading, not on that control — the whole point of these
     // cases is that it is not rendered yet.
     async function openSubscriberPicker() {
-      const heading = await screen.findByText("Activity");
+      const heading = await screen.findByRole("heading", { name: "Activity" });
       const header = heading.parentElement?.parentElement;
       const trigger = header?.querySelector('[data-slot="popover-trigger"]');
       if (!trigger) throw new Error("subscriber picker trigger not found");

@@ -8,6 +8,7 @@ import { useCommentComposerStore, useCommentDraftStore } from "@multica/core/iss
 import { WorkspaceSlugProvider } from "@multica/core/paths";
 import { renderWithI18n } from "../../test/i18n";
 import { CommentInput } from "./comment-input";
+import { RetainedReplyInput, RetainedReplyInputs } from "./retained-reply-input";
 import { ReplyInput } from "./reply-input";
 
 /** Shape of ContentEditor's `quickActionMenu` prop, as the composers pass it. */
@@ -47,6 +48,7 @@ const insertPlaceholderSpy = vi.hoisted(() => vi.fn());
 const insertMarkdownBehavior = vi.hoisted(() => ({ succeed: true }));
 // Lets a test drop the editor's uploading placeholder out of the document
 // (Cmd+Z after a paste) without settling the upload behind it.
+const editorUpdateBehavior = vi.hoisted(() => ({ deferred: false }));
 const editorUploadSignal = vi.hoisted(
   () => ({ notify: undefined as ((uploading: boolean) => void) | undefined }),
 );
@@ -122,7 +124,9 @@ vi.mock("../../editor", async () => ({
       onSubmit,
       onReady,
       quickActionMenu,
+      flushPendingOnUnmount,
     }: {
+      flushPendingOnUnmount?: boolean;
       defaultValue?: string;
       value?: string;
       onUpdate?: (markdown: string) => void;
@@ -154,6 +158,7 @@ vi.mock("../../editor", async () => ({
       onReady?.();
       return () => {
         destroyedRef.current = true;
+        if (flushPendingOnUnmount && editorUpdateBehavior.deferred) onUpdate?.(valueRef.current);
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
@@ -213,7 +218,7 @@ vi.mock("../../editor", async () => ({
         onChange={(event) => {
           valueRef.current = event.target.value;
           setEditorValue(event.target.value);
-          onUpdate?.(event.target.value);
+          if (!editorUpdateBehavior.deferred) onUpdate?.(event.target.value);
         }}
         onKeyDown={(event) => {
           // The editor's Mod+Enter submit shortcut — the path that skips the
@@ -309,6 +314,7 @@ beforeEach(() => {
   // (e.g. the failed-send case) would trip the composers' draft-direct-mount
   // path and hide the shell the next test expects.
   useCommentDraftStore.setState({ drafts: {} });
+  editorUpdateBehavior.deferred = false;
   editorDefaultValues.values = [];
   editorQuickActionMenu.last = undefined;
   focusCalls.focused = 0;
@@ -837,47 +843,49 @@ describe("comment composers", () => {
   });
 });
 
+const uploadAttachment = (id: string, url: string) =>
+  ({
+    id,
+    url,
+    download_url: url,
+    markdown_url: url,
+    filename: `${id}.png`,
+    content_type: "image/png",
+    size_bytes: 1,
+  }) as unknown as Attachment;
+
+/**
+ * Start an upload that stays in flight until the returned resolver runs. The
+ * coordinator calls `api.uploadFile`, so this controls THAT promise: resolve
+ * it with an attachment (success) or reject it (failure).
+ */
+function startPendingUpload(container: HTMLElement, filename = "slow.png") {
+  let resolveUpload!: (att: Attachment) => void;
+  let rejectUpload!: (err: Error) => void;
+  apiUploadFile.mockImplementationOnce(
+    () =>
+      new Promise<Attachment>((resolve, reject) => {
+        resolveUpload = resolve;
+        rejectUpload = reject;
+      }),
+  );
+  // FileUploadButton's visible control is a button that clicks a hidden
+  // input; the input is what carries the selection.
+  const input = container.querySelector('input[type="file"]');
+  if (!input) throw new Error("Expected a file input to render");
+  fireEvent.change(input, {
+    target: { files: [new File(["x"], filename, { type: "image/png" })] },
+  });
+  return {
+    resolve: (att: Attachment) => resolveUpload(att),
+    fail: () => rejectUpload(new Error("upload failed")),
+  };
+}
+
 // MUL-4808 — posting mid-upload strips the pending image's blob URL out of the
 // body and binds no attachment id, so the comment lands without the file.
 describe("comment composers — upload submit gate", () => {
-  const uploadAttachment = (id: string, url: string) =>
-    ({
-      id,
-      url,
-      download_url: url,
-      markdown_url: url,
-      filename: `${id}.png`,
-      content_type: "image/png",
-      size_bytes: 1,
-    }) as unknown as Attachment;
 
-  /**
-   * Start an upload that stays in flight until the returned resolver runs. The
-   * coordinator calls `api.uploadFile`, so this controls THAT promise: resolve
-   * it with an attachment (success) or reject it (failure).
-   */
-  function startPendingUpload(container: HTMLElement, filename = "slow.png") {
-    let resolveUpload!: (att: Attachment) => void;
-    let rejectUpload!: (err: Error) => void;
-    apiUploadFile.mockImplementationOnce(
-      () =>
-        new Promise<Attachment>((resolve, reject) => {
-          resolveUpload = resolve;
-          rejectUpload = reject;
-        }),
-    );
-    // FileUploadButton's visible control is a button that clicks a hidden
-    // input; the input is what carries the selection.
-    const input = container.querySelector('input[type="file"]');
-    if (!input) throw new Error("Expected a file input to render");
-    fireEvent.change(input, {
-      target: { files: [new File(["x"], filename, { type: "image/png" })] },
-    });
-    return {
-      resolve: (att: Attachment) => resolveUpload(att),
-      fail: () => rejectUpload(new Error("upload failed")),
-    };
-  }
 
   it("disables send while an upload is in flight and re-enables once it settles", async () => {
     const { container } = renderCommentInput();
@@ -1338,5 +1346,114 @@ describe.each(["reply", "description"])("annotations in %s drafts", (source) => 
     act(() => { useCommentDraftStore.getState().addAnnotation(draftKey, { ...annotation, id: "b", quote: "Another point" }); });
     await act(async () => accept("reply-new"));
     expect(useCommentDraftStore.getState().getAnnotations(draftKey)).toHaveLength(2);
+  });
+});
+
+
+describe("retained real reply sessions", () => {
+  const key = "reply:issue-1:root";
+  function Pool({ onSubmit = async () => true }: { onSubmit?: (content: string, attachmentIds?: string[], suppressAgentIds?: string[], steerTaskIds?: string[]) => Promise<string | boolean> }) {
+    const [phase, setPhase] = useState<"activity" | "chat" | null>("activity");
+    return <RetainedReplyInputs>
+      <button onClick={() => setPhase(null)}>Hide virtual row</button>
+      <button onClick={() => setPhase("chat")}>Show chat row</button>
+      {phase && <section key={phase} data-testid="reply-owner"><RetainedReplyInput inputKey={key}>
+        <ReplyInput issueId="issue-1" parentId="nested" draftKey={key} avatarType="member" avatarId="user-1" onSubmit={onSubmit} />
+      </RetainedReplyInput></section>}
+    </RetainedReplyInputs>;
+  }
+  const hide = async () => { await act(async () => fireEvent.click(screen.getByText("Hide virtual row"))); };
+  const show = () => fireEvent.click(screen.getByText("Show chat row"));
+
+  it("reclaims an activated empty editor once its virtual row is detached", async () => {
+    renderWithProviders(<Pool />);
+    activateComposer("reply-composer-shell");
+    const old = screen.getByTestId("editor");
+    await hide();
+    show();
+    expect(screen.getByTestId("reply-composer-shell")).toBeInTheDocument();
+    expect(screen.queryByTestId("editor")).not.toBeInTheDocument();
+    activateComposer("reply-composer-shell");
+    expect(screen.getByTestId("editor")).not.toBe(old);
+  });
+
+  it("protects the actual editor, draft and exact reply target across detachment", async () => {
+    useCommentDraftStore.getState().setReplyTarget(key, "nested", "Author");
+    renderWithProviders(<Pool />);
+    activateComposer("reply-composer-shell");
+    const editor = screen.getByTestId("editor");
+    fireEvent.change(editor, { target: { value: "Preserve my draft" } });
+    await hide();
+    show();
+    expect(screen.getByTestId("editor")).toBe(editor);
+    expect(editor).toHaveValue("Preserve my draft");
+    expect(useCommentDraftStore.getState().drafts[key]?.replyTarget?.commentId).toBe("nested");
+    fireEvent.change(editor, { target: { value: "" } });
+    await hide(); show();
+    expect(screen.getByTestId("editor")).toBe(editor);
+    expect(useCommentDraftStore.getState().drafts[key]?.replyTarget?.commentId).toBe("nested");
+  });
+
+  it("protects live editor text before a debounced draft update", async () => {
+    renderWithProviders(<Pool />);
+    activateComposer("reply-composer-shell");
+    const editor = screen.getByTestId("editor");
+    editorUpdateBehavior.deferred = true;
+    fireEvent.change(editor, { target: { value: "Not flushed yet" } });
+    expect(useCommentDraftStore.getState().getDraft(key)).toBeUndefined();
+    await hide(); show();
+    expect(screen.getByTestId("editor")).toBe(editor);
+    expect(editor).toHaveValue("Not flushed yet");
+  });
+
+  it("protects an upload that settles while detached without rebuilding its editor", async () => {
+    const { container } = renderWithProviders(<Pool />);
+    activateComposer("reply-composer-shell");
+    const editor = screen.getByTestId("editor");
+    const pending = startPendingUpload(container, "retained.png");
+    await hide();
+    expect(useCommentDraftStore.getState().getUploads(key)[0]?.status).toBe("uploading");
+    await act(async () => pending.resolve(uploadAttachment("retained", "https://cdn.example/retained.png")));
+    show();
+    expect(screen.getByTestId("editor")).toBe(editor);
+    expect(editor).toHaveValue("https://cdn.example/retained.png");
+    expect(useCommentDraftStore.getState().getAttachments(key).map((attachment) => attachment.id)).toEqual(["retained"]);
+  });
+
+  it("preserves the real single-flight send lock and reclaims the idle session after acceptance offscreen", async () => {
+    let accept!: (result: boolean) => void;
+    const submit = vi.fn(() => new Promise<boolean>((resolve) => { accept = resolve; }));
+    renderWithProviders(<Pool onSubmit={submit} />);
+    activateComposer("reply-composer-shell");
+    const editor = screen.getByTestId("editor");
+    fireEvent.change(editor, { target: { value: "Send once" } });
+    fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    await hide(); show();
+    expect(screen.getByTestId("editor")).toBe(editor);
+    expect(getSubmitButton(screen.getByTestId("reply-owner"))).toBeDisabled();
+    fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
+    expect(submit).toHaveBeenCalledTimes(1);
+    await hide();
+    await act(async () => accept(true));
+    show();
+    expect(screen.getByTestId("reply-composer-shell")).toBeInTheDocument();
+    expect(screen.queryByTestId("editor")).not.toBeInTheDocument();
+    expect(useCommentDraftStore.getState().getDraft(key)).toBeUndefined();
+  });
+});
+
+describe("reply tab unmount draft persistence", () => {
+  it("keeps text typed before the debounced draft update when the entire tab unmounts", () => {
+    const key = "reply:issue-1:comment-1" as const;
+    const first = renderReplyInput({ draftKey: key });
+    activateComposer("reply-composer-shell");
+    editorUpdateBehavior.deferred = true;
+    fireEvent.change(screen.getByTestId("editor"), { target: { value: "Unflushed tab body" } });
+    expect(useCommentDraftStore.getState().getDraft(key)).toBeUndefined();
+    first.unmount();
+    expect(useCommentDraftStore.getState().getDraft(key)).toBe("Unflushed tab body");
+    renderReplyInput({ draftKey: key });
+    expect(screen.getByTestId("editor")).toHaveValue("Unflushed tab body");
   });
 });
